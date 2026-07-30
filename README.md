@@ -84,9 +84,10 @@ The first run prints a URL — open it, sign in as the **target** account, appro
 | *(default)* / `--continue-if-incomplete` | Skip files that already exist in the target by name; copy only missing |
 | `--continue-with-re-copy` | Delete same-named **target** files, then re-copy from source (source is never deleted) |
 | `--verbose` / `-v` | Add a per-file log line on top of the status block |
-| `--skip-scan` | Skip the background source file count (no %/ETA in the status block) |
 
 Do not pass both `--continue-if-incomplete` and `--continue-with-re-copy`.
+
+`--skip-scan` was removed — there is no longer a separate pre-scan pass to skip. Passing it prints a note and is ignored.
 
 ### Environment variables
 
@@ -96,12 +97,14 @@ Do not pass both `--continue-if-incomplete` and `--continue-with-re-copy`.
 | `TARGET_FOLDER_ID` | — | Destination folder ID (required) |
 | `GOOGLE_OAUTH_CREDENTIALS` | `./credentials.json` | Path to OAuth client JSON |
 | `GOOGLE_OAUTH_TOKEN` | `./token.json` | Where to store tokens |
-| `DRIVE_REQUEST_DELAY_MS` | `200` | Pause after copy/create/delete API calls |
-| `SCAN_REQUEST_DELAY_MS` | `min(50, delay)` | Pause during read-only source scan |
+| `WALK_CONCURRENCY` | `6` | Folder-walker workers (listing) |
+| `COPY_CONCURRENCY` | `8` | File-copy workers |
+| `READ_RATE` / `READ_RATE_MAX` | `15` / `40` | Read requests per second: starting rate and ceiling |
+| `WRITE_RATE` / `WRITE_RATE_MAX` | `6` / `20` | Write requests per second: starting rate and ceiling |
+| `FILE_QUEUE_MAX` | `20000` | Backpressure cap on queued-but-uncopied files |
 | `DRIVE_MAX_RETRIES` | `10` | Retries for 429 / rate-limit 403 / 5xx / network errors |
 | `LOG_INTERVAL_MS` | `1000` | How often the two-line status block is printed (min `200`) |
 | `VERBOSE` | — | Set to `1` for verbose logs |
-| `SKIP_PRE_SCAN` | — | Set to `1` to skip the source pre-scan |
 | `ID_MAP_PATH` | `./id-map.json` | Path used by link-rewrite scripts |
 | `FORCE_REBUILD_DETAILED_MAP` | — | Set to `1` to rebuild `id-map-detailed.json` |
 
@@ -159,8 +162,12 @@ Smart chips (rich links) are replaced by deleting the chip and inserting a norma
 - **Trashed** items are skipped (`trashed = false`).
 - **Shortcuts** are skipped and logged; copy their targets manually if needed.
 - Existing **folders** in the target with the same name are reused (not duplicated).
-- Status is printed as a two-line block once per second (`[progress]` + `[scan]`); a background scan counts source files for %/ETA (unless `--skip-scan`). A scan failure is reported on the `[scan]` line and does not stop the copy.
-- **Rate limits**: increase `DRIVE_REQUEST_DELAY_MS` and re-run with `--continue-if-incomplete`.
+- Status is printed as a two-line block once per second (`[progress]` + `[scan]`). Totals and ETA firm up as the walk discovers the tree; percentages are prefixed `~` until discovery finishes.
+- **Concurrent**, with duplicate-safety by construction: a folder queue is drained by `WALK_CONCURRENCY` walkers, and each source folder is enqueued exactly once, so exactly one worker ever writes into a given target folder. Walkers feed a file queue drained by `COPY_CONCURRENCY` copiers, overlapping traversal with copying.
+- **Rate limits** are handled by an adaptive governor with separate read/write token buckets. A 403/429 cuts the rate for every worker at once (coalesced, so one episode is one cut) and the rate creeps back up once things are calm. You should not need to tune this by hand.
+- **Only one run at a time**: `.migrate.lock` prevents two concurrent migrations, which would each duplicate what the other creates. Delete it manually if a process died hard.
+- **Failures do not abort the run.** Per-file and per-folder errors are logged to `logs/issues.log` (along with skipped shortcuts and ambiguous folder names), and the process exits non-zero so you know to re-run with `--continue-if-incomplete`.
+- **Ctrl+C** stops cleanly after in-flight requests finish; press it twice to force quit.
 - **Shared drives**: listing/copy use `supportsAllDrives` / `includeItemsFromAllDrives`.
 
 ## Security
