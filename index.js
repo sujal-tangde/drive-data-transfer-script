@@ -17,7 +17,6 @@ import * as readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { google } from 'googleapis';
 import dotenv from 'dotenv';
-import cliProgress from 'cli-progress';
 dotenv.config();
 
 const VERBOSE =
@@ -71,6 +70,9 @@ const SCAN_REQUEST_DELAY_MS =
 /** Max retries per API call for transient errors. */
 const MAX_RETRIES = Math.max(1, Number(process.env.DRIVE_MAX_RETRIES) || 10);
 
+/** How often the two-line status block is printed (ms). */
+const LOG_INTERVAL_MS = Math.max(200, Number(process.env.LOG_INTERVAL_MS) || 1000);
+
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -80,27 +82,90 @@ function truncateName(name, max = 45) {
   return `${name.slice(0, max - 1)}…`;
 }
 
-function createScanReporter() {
-  let lastWrite = 0;
-  let lastLog = 0;
-  return (acc) => {
-    const now = Date.now();
-    if (now - lastWrite >= 300) {
-      lastWrite = now;
-      process.stdout.write(
-        `\r[scan] ${acc.folders} folders, ${acc.files} files…`,
-      );
-    }
-    if (now - lastLog >= 5000) {
-      lastLog = now;
-      finishScanLine();
-      console.log(`[scan] still counting… ${acc.folders} folders, ${acc.files} files`);
-    }
-  };
+function formatDuration(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const h = String(Math.floor(total / 3600)).padStart(2, '0');
+  const m = String(Math.floor((total % 3600) / 60)).padStart(2, '0');
+  const s = String(total % 60).padStart(2, '0');
+  return `${h}:${m}:${s}`;
 }
 
-function finishScanLine() {
-  process.stdout.write('\n');
+/**
+ * Prints a fixed two-line status block ([progress] + [scan]) once per interval.
+ * Plain console lines only — no cursor tricks — so retry/warn logs stay readable
+ * and the copy loop never fights the background scan for the same terminal line.
+ *
+ * @param {Record<string, number>} stats
+ * @param {{ enabled: boolean, done: boolean, files: number, folders: number, totalFiles: number, error?: string }} scanState
+ * @param {{ currentFile: string, currentFolder: string }} runtime
+ */
+function createStatusLogger(stats, scanState, runtime) {
+  const startedAt = Date.now();
+  let timer = null;
+
+  const tick = () => {
+    const processed = progressDoneCount(stats);
+    const elapsedMs = Date.now() - startedAt;
+    const rate = processed / Math.max(1, elapsedMs / 1000);
+
+    const progress = [
+      `[progress] ${processed} processed, ${stats.filesSkipped} skipped, ${stats.filesCopied} copied`,
+      `${stats.foldersCreated} folders created, ${stats.foldersReused} reused`,
+    ];
+    if (stats.filesReplaced) progress.push(`${stats.filesReplaced} replaced`);
+    if (stats.skippedShortcuts) progress.push(`${stats.skippedShortcuts} shortcuts skipped`);
+    progress.push(`${rate.toFixed(1)} files/s`, `elapsed ${formatDuration(elapsedMs)}`);
+    if (scanState.done && scanState.totalFiles > 0) {
+      const pct = Math.min(100, (processed / scanState.totalFiles) * 100);
+      const remaining = Math.max(0, scanState.totalFiles - processed);
+      progress.push(
+        `${pct.toFixed(1)}% of ${scanState.totalFiles}`,
+        `ETA ${rate > 0 ? formatDuration((remaining / rate) * 1000) : '--:--:--'}`,
+      );
+    }
+
+    let head;
+    if (!scanState.enabled) head = '[scan] skipped (--skip-scan)';
+    else if (scanState.error) head = `[scan] failed: ${scanState.error}`;
+    else if (scanState.done) head = `[scan] complete — ${scanState.folders} folders, ${scanState.files} files`;
+    else head = `[scan] counting… ${scanState.folders} folders, ${scanState.files} files`;
+
+    const scan = [head];
+    if (runtime.currentFolder) scan.push(`folder: ${truncateName(runtime.currentFolder, 30)}`);
+    scan.push(`now: ${truncateName(runtime.currentFile, 40)}`);
+
+    const progressLine = progress.join(' | ');
+    const scanLine = scan.join(' | ');
+    // Rule spans the widest line so each tick reads as one block; recomputed
+    // every tick so a terminal resize is picked up.
+    const rule = '-'.repeat(
+      Math.min(
+        Math.max(progressLine.length, scanLine.length),
+        (process.stdout.columns || 120) - 1,
+      ),
+    );
+
+    console.log(rule);
+    console.log(progressLine);
+    console.log(scanLine);
+    console.log(rule);
+  };
+
+  return {
+    start() {
+      if (timer) return;
+      tick();
+      timer = setInterval(tick, LOG_INTERVAL_MS);
+      timer.unref?.();
+    },
+    stop() {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+      tick();
+    },
+  };
 }
 
 function parseRetryAfterMs(headers) {
@@ -281,14 +346,8 @@ const SHORTCUT_MIME = 'application/vnd.google-apps.shortcut';
  * so deletes can never target the source folder by accident.
  * @param {import('googleapis').drive_v3.Drive} drive
  */
-async function scanSourceTree(
-  drive,
-  folderId,
-  acc = { files: 0, folders: 0, ids: new Set() },
-  onProgress,
-) {
+async function scanSourceTree(drive, folderId, acc = { files: 0, folders: 0, ids: new Set() }) {
   acc.ids.add(folderId);
-  onProgress?.(acc);
   const children = await listChildren(drive, folderId, { delayMs: SCAN_REQUEST_DELAY_MS });
 
   for (const item of children) {
@@ -297,14 +356,12 @@ async function scanSourceTree(
 
     if (item.mimeType === FOLDER_MIME) {
       acc.folders += 1;
-      onProgress?.(acc);
-      await scanSourceTree(drive, item.id, acc, onProgress);
+      await scanSourceTree(drive, item.id, acc);
       continue;
     }
 
     if (item.mimeType === SHORTCUT_MIME) continue;
     acc.files += 1;
-    onProgress?.(acc);
   }
 
   return acc;
@@ -333,21 +390,16 @@ function progressDoneCount(stats) {
   return stats.filesCopied + stats.filesSkipped;
 }
 
-function bumpProgressBar(bar, progressState, stats, filename) {
-  if (!bar) return;
-  if (
-    progressState?.scanDone &&
-    progressState.totalFiles > 0 &&
-    bar.getTotal() !== progressState.totalFiles
-  ) {
-    bar.options.format = progressState.fullBarFormat;
-    bar.setTotal(progressState.totalFiles);
-  }
-  bar.update(progressDoneCount(stats), { filename: truncateName(filename) });
-}
-
-async function copyFolderTree(drive, sourceFolderId, targetParentId, stats, ctx = {}, depth = 0) {
-  const { bar, sourceIds, progressState, copyMode } = ctx;
+async function copyFolderTree(
+  drive,
+  sourceFolderId,
+  targetParentId,
+  stats,
+  ctx = {},
+  depth = 0,
+  folderName = '/',
+) {
+  const { sourceIds, runtime, copyMode } = ctx;
   const indent = '  '.repeat(depth);
   if (sourceIds) sourceIds.add(sourceFolderId);
   const children = await listChildren(drive, sourceFolderId);
@@ -357,6 +409,8 @@ async function copyFolderTree(drive, sourceFolderId, targetParentId, stats, ctx 
     const { id, name, mimeType } = item;
     if (!id || !name) continue;
     if (sourceIds) sourceIds.add(id);
+    // Reset after any recursion so the status line names the folder in progress.
+    if (runtime) runtime.currentFolder = folderName;
 
     if (mimeType === FOLDER_MIME) {
       const existingFolders = targetChildren.filter(
@@ -392,7 +446,7 @@ async function copyFolderTree(drive, sourceFolderId, targetParentId, stats, ctx 
       }
       if (REQUEST_DELAY_MS) await sleep(REQUEST_DELAY_MS);
 
-      await copyFolderTree(drive, id, newFolderId, stats, ctx, depth + 1);
+      await copyFolderTree(drive, id, newFolderId, stats, ctx, depth + 1, name);
       continue;
     }
 
@@ -411,8 +465,8 @@ async function copyFolderTree(drive, sourceFolderId, targetParentId, stats, ctx 
     // Resume mode: same-named file already in target → skip (no delete, no re-copy).
     if (copyMode === 'skip' && existingSameName.length > 0) {
       if (VERBOSE) console.log(`${indent}Skipping existing file: ${name}`);
+      if (runtime) runtime.currentFile = name;
       stats.filesSkipped += 1;
-      bumpProgressBar(bar, progressState, stats, name);
       continue;
     }
 
@@ -428,6 +482,7 @@ async function copyFolderTree(drive, sourceFolderId, targetParentId, stats, ctx 
     }
 
     if (VERBOSE) console.log(`${indent}Copying file: ${name}`);
+    if (runtime) runtime.currentFile = name;
     await withRetry(`files.copy ${name}`, () =>
       drive.files.copy({
         fileId: id,
@@ -440,7 +495,6 @@ async function copyFolderTree(drive, sourceFolderId, targetParentId, stats, ctx 
       }),
     );
     stats.filesCopied += 1;
-    bumpProgressBar(bar, progressState, stats, name);
     if (REQUEST_DELAY_MS) await sleep(REQUEST_DELAY_MS);
   }
 }
@@ -467,17 +521,18 @@ async function main() {
 
   const sourceIds = new Set([SOURCE_FOLDER_ID]);
 
-  const barFormats = {
-    counting: 'Progress | {value} files | {filename} | total: counting…',
-    full: 'Progress |{bar}| {percentage}% | {value}/{total} files | ETA: {eta_formatted} | {filename}',
+  /** Live scan counters — the status logger reads these while the scan runs. */
+  const scanState = {
+    files: 0,
+    folders: 0,
+    ids: sourceIds,
+    enabled: !SKIP_PRE_SCAN,
+    done: SKIP_PRE_SCAN,
+    totalFiles: 0,
   };
 
-  /** @type {{ scanDone: boolean, totalFiles: number, fullBarFormat: string }} */
-  const progressState = {
-    scanDone: SKIP_PRE_SCAN,
-    totalFiles: 0,
-    fullBarFormat: barFormats.full,
-  };
+  /** What the copy loop is touching right now, for the status line. */
+  const runtime = { currentFile: 'starting…', currentFolder: '' };
 
   console.log('Source folder will not be modified (list + copy only).');
   if (COPY_MODE === 'skip') {
@@ -493,53 +548,37 @@ async function main() {
   console.log(`  Source folder: ${SOURCE_FOLDER_ID}`);
   console.log(`  Target parent: ${TARGET_FOLDER_ID}`);
 
-  /** @type {import('cli-progress').SingleBar | null} */
-  let bar = null;
-  if (!VERBOSE) {
-    bar = new cliProgress.SingleBar(
-      {
-        format: barFormats.counting,
-        hideCursor: true,
-        clearOnComplete: false,
-      },
-      cliProgress.Presets.shades_classic,
-    );
-    bar.start(1, 0, { filename: 'starting…' });
-    console.log('  Copy progress below; scan runs in parallel to compute %/ETA.');
-  } else {
-    console.log('  Verbose per-file logs enabled.');
-  }
+  if (VERBOSE) console.log('  Verbose per-file logs enabled.');
+  console.log(`  Status printed every ${LOG_INTERVAL_MS}ms (2 lines per tick).`);
 
-  let scanPromise = Promise.resolve({ files: 0, folders: 0 });
+  let scanPromise = Promise.resolve(scanState);
   if (!SKIP_PRE_SCAN) {
     console.log('[scan] Counting source files in background (read-only)…');
-    const reportScan = createScanReporter();
-    const scanAcc = { files: 0, folders: 0, ids: sourceIds };
-    scanPromise = scanSourceTree(drive, SOURCE_FOLDER_ID, scanAcc, reportScan).then((result) => {
-      finishScanLine();
-      progressState.scanDone = true;
-      progressState.totalFiles = result.files;
-      console.log(`[scan] Complete: ${result.files} file(s) in ${result.folders} folder(s).`);
-      if (bar && result.files > 0) {
-        bar.options.format = barFormats.full;
-        bar.setTotal(result.files);
-        bar.update(progressDoneCount(stats));
-        bar.render();
-      }
-      return result;
-    });
+    scanPromise = scanSourceTree(drive, SOURCE_FOLDER_ID, scanState)
+      .then((result) => {
+        scanState.done = true;
+        scanState.totalFiles = result.files;
+        return result;
+      })
+      // A failed count must not kill an in-flight copy; it only costs us %/ETA.
+      .catch((err) => {
+        scanState.error = String(err?.response?.data?.error?.message ?? err?.message ?? err);
+        return scanState;
+      });
   }
+
+  const status = createStatusLogger(stats, scanState, runtime);
+  status.start();
 
   try {
     await copyFolderTree(drive, SOURCE_FOLDER_ID, TARGET_FOLDER_ID, stats, {
-      bar,
       sourceIds,
-      progressState,
+      runtime,
       copyMode: COPY_MODE,
     });
     await scanPromise;
   } finally {
-    if (bar) bar.stop();
+    status.stop();
   }
 
   console.log('\nDone.');

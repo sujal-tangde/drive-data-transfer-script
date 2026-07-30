@@ -83,8 +83,8 @@ The first run prints a URL — open it, sign in as the **target** account, appro
 |------|---------|
 | *(default)* / `--continue-if-incomplete` | Skip files that already exist in the target by name; copy only missing |
 | `--continue-with-re-copy` | Delete same-named **target** files, then re-copy from source (source is never deleted) |
-| `--verbose` / `-v` | Per-file logs instead of the progress bar |
-| `--skip-scan` | Skip the background source file count (no %/ETA on the progress bar) |
+| `--verbose` / `-v` | Add a per-file log line on top of the status block |
+| `--skip-scan` | Skip the background source file count (no %/ETA in the status block) |
 
 Do not pass both `--continue-if-incomplete` and `--continue-with-re-copy`.
 
@@ -99,6 +99,7 @@ Do not pass both `--continue-if-incomplete` and `--continue-with-re-copy`.
 | `DRIVE_REQUEST_DELAY_MS` | `200` | Pause after copy/create/delete API calls |
 | `SCAN_REQUEST_DELAY_MS` | `min(50, delay)` | Pause during read-only source scan |
 | `DRIVE_MAX_RETRIES` | `10` | Retries for 429 / rate-limit 403 / 5xx / network errors |
+| `LOG_INTERVAL_MS` | `1000` | How often the two-line status block is printed (min `200`) |
 | `VERBOSE` | — | Set to `1` for verbose logs |
 | `SKIP_PRE_SCAN` | — | Set to `1` to skip the source pre-scan |
 | `ID_MAP_PATH` | `./id-map.json` | Path used by link-rewrite scripts |
@@ -158,7 +159,7 @@ Smart chips (rich links) are replaced by deleting the chip and inserting a norma
 - **Trashed** items are skipped (`trashed = false`).
 - **Shortcuts** are skipped and logged; copy their targets manually if needed.
 - Existing **folders** in the target with the same name are reused (not duplicated).
-- Progress bar shows copy progress; a background scan counts source files for %/ETA (unless `--skip-scan`).
+- Status is printed as a two-line block once per second (`[progress]` + `[scan]`); a background scan counts source files for %/ETA (unless `--skip-scan`). A scan failure is reported on the `[scan]` line and does not stop the copy.
 - **Rate limits**: increase `DRIVE_REQUEST_DELAY_MS` and re-run with `--continue-if-incomplete`.
 - **Shared drives**: listing/copy use `supportsAllDrives` / `includeItemsFromAllDrives`.
 
