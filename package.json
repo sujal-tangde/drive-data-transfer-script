@@ -1,0 +1,18 @@
+{
+  "name": "drive-folder-migrate",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Recursively copy a shared Drive folder into another account (native Google Docs preserved).",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "googleapis": "^144.0.0"
+  }
+}
