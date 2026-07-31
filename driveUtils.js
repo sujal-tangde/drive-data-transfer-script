@@ -12,13 +12,31 @@
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import dotenv from 'dotenv';
 
 // Loaded here rather than only in the entry scripts: ESM evaluates an imported
 // module's body *before* the importer's body, so a dotenv.config() call in
 // index.js would run after the constants below had already read an empty
-// process.env. Calling it again in an entry script is harmless.
-dotenv.config();
+// process.env.
+dotenv.config({ quiet: true });
+
+/**
+ * True when the calling module is the process entry point (node, PM2, etc.).
+ *
+ * The caller MUST pass its own `import.meta.url`. There is no defaulting it
+ * here: `import.meta.url` resolves lexically, so a default value written in
+ * this file would always be *this* file's URL and every caller's guard would
+ * be false — the scripts would import and then silently do nothing.
+ */
+export function isMainModule(metaUrl) {
+  if (!metaUrl) {
+    throw new TypeError('isMainModule(import.meta.url): pass the caller’s import.meta.url');
+  }
+  const entry = process.argv[1];
+  if (!entry) return false;
+  return pathToFileURL(path.resolve(entry)).href === metaUrl;
+}
 
 export const VERBOSE =
   process.argv.includes('--verbose') ||
@@ -53,6 +71,22 @@ export const WRITE_RATE_MAX = Math.max(
 
 /** Cap on queued-but-uncopied files, so walkers cannot outrun copiers unboundedly. */
 export const FILE_QUEUE_MAX = Math.floor(envNum('FILE_QUEUE_MAX', 20_000, { min: 100 }));
+
+/**
+ * Google Docs workers in updateDocLinks.js. Capped low on purpose: each doc is
+ * a read plus one or more batchUpdate writes against the Docs API, whose quota
+ * is far tighter than Drive's.
+ */
+export const DOC_CONCURRENCY = Math.floor(envNum('DOC_CONCURRENCY', 4, { min: 1, max: 8 }));
+
+/**
+ * Docs API request rates. Deliberately its own bucket: the Docs quota is
+ * separate from Drive's, so a Docs 429 must not throttle Drive listing (or
+ * vice versa). Conservative by default — the old code effectively self-limited
+ * to ~5 req/s by sleeping 200ms between calls.
+ */
+export const DOCS_RATE = envNum('DOCS_RATE', 3, { min: 0.2, max: 100 });
+export const DOCS_RATE_MAX = Math.max(DOCS_RATE, envNum('DOCS_RATE_MAX', 8, { min: 0.2, max: 200 }));
 
 /** Max retries per API call for transient errors. */
 export const MAX_RETRIES = Math.max(
@@ -173,6 +207,7 @@ export class RateGovernor {
 export const governors = {
   read: new RateGovernor('read', { rate: READ_RATE, maxRate: READ_RATE_MAX, minRate: 1 }),
   write: new RateGovernor('write', { rate: WRITE_RATE, maxRate: WRITE_RATE_MAX, minRate: 0.5 }),
+  docs: new RateGovernor('docs', { rate: DOCS_RATE, maxRate: DOCS_RATE_MAX, minRate: 0.5 }),
 };
 
 /** FIFO with amortized O(1) dequeue — plain Array#shift is O(n) at 30k+ jobs. */
@@ -290,6 +325,43 @@ export async function driveCall(kind, label, fn) {
   throw lastErr;
 }
 
+/**
+ * Google Docs API call: same retry and AIMD machinery as driveCall, charged to
+ * the separate `docs` bucket so Docs throttling never slows Drive listing.
+ */
+export function docsCall(label, fn) {
+  return driveCall('docs', label, fn);
+}
+
+/**
+ * Runs `handler` over `items` with at most `concurrency` in flight, returning
+ * results in **input order** regardless of completion order — callers write
+ * ordered JSON logs from it, so completion order must not leak through.
+ *
+ * `handler` is expected to deal with its own failures; a throw rejects the
+ * whole pool.
+ */
+export async function runPool(items, concurrency, handler) {
+  const results = new Array(items.length);
+  let next = 0;
+
+  const worker = async () => {
+    for (;;) {
+      // Claim an index synchronously — no await between read and increment, so
+      // two workers can never take the same item.
+      const i = next;
+      next += 1;
+      if (i >= items.length) return;
+      results[i] = await handler(items[i], i);
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, () => worker()),
+  );
+  return results;
+}
+
 /** Serialized appends so concurrent workers cannot interleave a log line. */
 let logDirReady = null;
 let issueLogChain = Promise.resolve();
@@ -397,7 +469,8 @@ export function createStatusPrinter(renderLines, { intervalMs = LOG_INTERVAL_MS 
  * instead of two pools competing for the same quota.
  *
  * @param {import('googleapis').drive_v3.Drive} drive
- * @param {Array<{side: string, id: string}>} roots
+ * @param {Array<{side: string, id: string, path?: string}>} roots
+ *   `path` seeds the prefix every discovered path is built under (default '').
  * @param {{
  *   queues: {folders: Queue},
  *   visited: Set<string>,
@@ -414,8 +487,9 @@ export async function walkTrees(drive, roots, ctx) {
   const { queues, visited } = ctx;
 
   for (const root of roots) {
-    visited.add(`${root.side} ${root.id} `);
-    queues.folders.push({ side: root.side, id: root.id, path: '', depth: 0 });
+    const rootPath = root.path ?? '';
+    visited.add(`${root.side}\u0000${root.id}\u0000${rootPath}`);
+    queues.folders.push({ side: root.side, id: root.id, path: rootPath, depth: 0 });
   }
 
   let active = 0;
@@ -467,7 +541,7 @@ async function walkOneFolder(drive, job, ctx) {
       // folder once); here the comparison is by *path*, so the same folder
       // reached by two paths is two entries and the visit key has to include
       // the path. Repeat visits and cycles still stop here.
-      const key = `${job.side} ${id} ${fullPath}`;
+      const key = `${job.side}\u0000${id}\u0000${fullPath}`;
       if (visited.has(key)) {
         stats.foldersDeduped += 1;
         continue;

@@ -16,12 +16,9 @@
  *     for a clean comparison.
  */
 
-import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { google } from 'googleapis';
 import fs from 'fs/promises';
 
-import dotenv from 'dotenv';
 import {
   apiStats,
   createStatusPrinter,
@@ -29,6 +26,7 @@ import {
   flushIssues,
   formatDuration,
   governors,
+  isMainModule,
   ISSUE_LOG,
   READ_RATE,
   READ_RATE_MAX,
@@ -36,7 +34,6 @@ import {
   WALK_CONCURRENCY,
   walkTrees,
 } from './driveUtils.js';
-dotenv.config();
 
 // Paths
 const CREDENTIALS_PATH = './credentials.json';
@@ -201,10 +198,7 @@ async function main() {
 }
 
 // Guarded so tests can import the comparison without running a full listing.
-const isEntryPoint =
-    process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-
-if (isEntryPoint) {
+if (isMainModule(import.meta.url)) {
     main().catch(err => {
         console.error('❌ Error:', err.response?.data || err.message || err);
         process.exit(1);

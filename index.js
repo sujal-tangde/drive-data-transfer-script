@@ -25,10 +25,8 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as readline from 'node:readline/promises';
-import { fileURLToPath } from 'node:url';
 import { stdin as input, stdout as output } from 'node:process';
 import { google } from 'googleapis';
-import dotenv from 'dotenv';
 import {
   apiStats,
   appendIssue,
@@ -40,6 +38,7 @@ import {
   FOLDER_MIME,
   formatDuration,
   governors,
+  isMainModule,
   ISSUE_LOG,
   listChildren,
   LOG_INTERVAL_MS,
@@ -56,7 +55,6 @@ import {
   WRITE_RATE,
   WRITE_RATE_MAX,
 } from './driveUtils.js';
-dotenv.config();
 
 const WANT_CONTINUE_IF_INCOMPLETE = process.argv.includes('--continue-if-incomplete');
 const WANT_CONTINUE_WITH_RE_COPY = process.argv.includes('--continue-with-re-copy');
@@ -650,10 +648,7 @@ async function main() {
 }
 
 // Guarded so tests can import the pool internals without starting a migration.
-const isEntryPoint =
-  process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-
-if (isEntryPoint) {
+if (isMainModule(import.meta.url)) {
   main().catch(async (err) => {
     await releaseLock();
     console.error(err.response?.data ?? err);

@@ -29,11 +29,29 @@
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { google } from 'googleapis';
-import dotenv from 'dotenv';
 import { buildIdMap } from './buildIdMap.js';
-dotenv.config();
+import {
+  apiStats,
+  appendIssue,
+  createStatusPrinter,
+  createWalkContext,
+  DOC_CONCURRENCY,
+  DOCS_RATE,
+  DOCS_RATE_MAX,
+  driveCall,
+  docsCall,
+  flushIssues,
+  formatDuration,
+  governors,
+  isMainModule,
+  READ_RATE,
+  READ_RATE_MAX,
+  runPool,
+  truncateName,
+  WALK_CONCURRENCY,
+  walkTrees,
+} from './driveUtils.js';
 
 // ---- Config ----
 const SOURCE_FOLDER_ID = process.env.SOURCE_FOLDER_ID;
@@ -52,74 +70,10 @@ function createRunLogsDir() {
   return path.join(LOGS_BASE_DIR, `run-${stamp}-${process.pid}`);
 }
 
-const REQUEST_DELAY_MS = Math.max(0, Number(process.env.DRIVE_REQUEST_DELAY_MS) || 200);
-const MAX_RETRIES = Math.max(1, Number(process.env.DRIVE_MAX_RETRIES) || 10);
 const FORCE_REBUILD_DETAILED_MAP = process.env.FORCE_REBUILD_DETAILED_MAP === '1';
 
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
 const DOC_MIME = 'application/vnd.google-apps.document';
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-
-// ---- Retry helper ----
-function parseRetryAfterMs(headers) {
-  const raw = headers?.['retry-after'] ?? headers?.['Retry-After'];
-  if (raw == null) return null;
-  const sec = Number(raw);
-  if (!Number.isFinite(sec)) return null;
-  return Math.min(120_000, Math.max(0, sec * 1000));
-}
-
-function isUserRateLimitError(err) {
-  const status = err?.response?.status ?? err?.code;
-  if (status !== 403) return false;
-  const errors = err?.response?.data?.error?.errors;
-  if (Array.isArray(errors)) {
-    return errors.some(
-      (e) =>
-        e?.reason === 'userRateLimitExceeded' ||
-        e?.reason === 'rateLimitExceeded' ||
-        String(e?.message ?? '').toLowerCase().includes('rate'),
-    );
-  }
-  const msg = String(err?.response?.data?.error?.message ?? err?.message ?? '').toLowerCase();
-  return msg.includes('rate limit') || msg.includes('quota');
-}
-
-async function withRetry(label, fn) {
-  let attempt = 0;
-  let lastErr;
-  while (attempt < MAX_RETRIES) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      const status = err?.response?.status ?? err?.code;
-      const rl403 = isUserRateLimitError(err);
-      const retryable =
-        status === 429 ||
-        rl403 ||
-        status === 500 ||
-        status === 502 ||
-        status === 503 ||
-        status === 504 ||
-        err?.message?.includes?.('ECONNRESET') ||
-        err?.message?.includes?.('ETIMEDOUT');
-      if (!retryable || attempt === MAX_RETRIES - 1) throw err;
-      const fromHeader = parseRetryAfterMs(err?.response?.headers);
-      const base = rl403 ? 2000 * 2 ** attempt : 500 * 2 ** attempt;
-      const backoff = fromHeader ?? Math.min(rl403 ? 120_000 : 60_000, base);
-      const jitter = Math.floor(Math.random() * (rl403 ? 2000 : 250));
-      console.warn(
-        `[retry] ${label} failed (${status ?? err?.message}). Waiting ${backoff + jitter}ms (attempt ${attempt + 1}/${MAX_RETRIES})`,
-      );
-      await sleep(backoff + jitter);
-      attempt += 1;
-    }
-  }
-  throw lastErr;
-}
 
 // ---- Auth ----
 export async function authorize() {
@@ -136,54 +90,72 @@ export async function authorize() {
   return oAuth2Client;
 }
 
-// ---- Drive: list children with pagination ----
-async function listChildren(drive, folderId) {
-  const all = [];
-  let pageToken;
-  do {
-    const res = await withRetry('files.list', () =>
-      drive.files.list({
-        q: `'${folderId}' in parents and trashed = false`,
-        fields: 'nextPageToken, files(id, name, mimeType)',
-        pageSize: 1000,
-        pageToken,
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-      }),
-    );
-    for (const f of res.data.files || []) all.push(f);
-    pageToken = res.data.nextPageToken;
-    if (REQUEST_DELAY_MS) await sleep(REQUEST_DELAY_MS);
-  } while (pageToken);
-  return all;
-}
-
-// ---- Recursive walk: collect Google Docs AND every other item.
+// ---- Concurrent walk: collect Google Docs AND every other item.
 // Single pass so we can build a name-index of the target tree for the
 // MISSING_IN_ID_MAP fallback resolver.
+//
+// Drained by WALK_CONCURRENCY workers through the shared read governor, so
+// listing is paced adaptively instead of by a fixed sleep per page.
 export async function listTarget(
   drive,
   folderId,
   prefix = '',
   out = { docs: [], allItems: [] },
+  { onStatus } = {},
 ) {
-  const children = await listChildren(drive, folderId);
-  for (const f of children) {
-    if (!f.id || !f.name) continue;
-    const fullPath = prefix ? `${prefix}/${f.name}` : f.name;
-    out.allItems.push({
-      id: f.id,
-      name: f.name,
-      mimeType: f.mimeType,
-      path: fullPath,
-    });
-    if (f.mimeType === FOLDER_MIME) {
-      await listTarget(drive, f.id, fullPath, out);
-    } else if (f.mimeType === DOC_MIME) {
-      out.docs.push({ id: f.id, name: f.name, path: fullPath });
-    }
+  const ctx = createWalkContext({
+    scan: { tree: { folders: 0, files: 0 } },
+    onFolder(side, fullPath, f) {
+      out.allItems.push({ id: f.id, name: f.name, mimeType: f.mimeType, path: fullPath });
+    },
+    onFile(side, fullPath, f) {
+      out.allItems.push({ id: f.id, name: f.name, mimeType: f.mimeType, path: fullPath });
+      if (f.mimeType === DOC_MIME) {
+        out.docs.push({ id: f.id, name: f.name, path: fullPath });
+      }
+    },
+  });
+
+  const status = onStatus ? onStatus(ctx) : null;
+  status?.start();
+  try {
+    await walkTrees(drive, [{ side: 'tree', id: folderId, path: prefix }], ctx);
+    ctx.done = true;
+  } finally {
+    status?.stop();
   }
+
+  if (ctx.stats.errors) {
+    console.warn(
+      `[warn] ${ctx.stats.errors} folders could not be listed — the scan is incomplete.`,
+    );
+  }
+
   return out;
+}
+
+/** Two-line status block for the folder scan. */
+function createScanStatusLogger(ctx, label) {
+  const startedAt = Date.now();
+
+  return createStatusPrinter(() => {
+    const s = ctx.scan.tree;
+    const progress = [
+      `[progress] ${label}: ${s.files} files / ${s.folders} folders`,
+    ];
+    if (ctx.stats.errors) progress.push(`${ctx.stats.errors} errors`);
+    progress.push(`elapsed ${formatDuration(Date.now() - startedAt)}`);
+
+    const scan = [
+      ctx.done ? '[scan] scan complete' : '[scan] scanning…',
+      `queue: ${ctx.queues.folders.size} folders`,
+      `api ${governors.read.rate.toFixed(1)}/s read`,
+    ];
+    if (apiStats.retries) scan.push(`${apiStats.retries} retries`);
+    scan.push(`in: ${truncateName(ctx.runtime.currentFolder || '/', 40)}`);
+
+    return [progress.join(' | '), scan.join(' | ')];
+  });
 }
 
 function buildNameIndex(allItems) {
@@ -254,16 +226,17 @@ function viewerUrlForMime(id, mimeType) {
 }
 
 // ---- id-map-detailed.json builder ----
+// One files.get per entry, run through the shared read governor with
+// WALK_CONCURRENCY workers. runPool returns results in input order, so the
+// written file keeps the same entry order as the id-map it came from.
 async function buildDetailedMap(drive, idMap) {
   const entries = Object.entries(idMap);
-  const detailed = [];
-  let i = 0;
-  for (const [oldId, newId] of entries) {
-    i += 1;
+
+  return runPool(entries, WALK_CONCURRENCY, async ([oldId, newId], i) => {
     let name = '';
     let mimeType = '';
     try {
-      const res = await withRetry(`files.get ${newId}`, () =>
+      const res = await driveCall('read', `files.get ${newId}`, () =>
         drive.files.get({
           fileId: newId,
           fields: 'id, name, mimeType',
@@ -274,19 +247,17 @@ async function buildDetailedMap(drive, idMap) {
       mimeType = res.data.mimeType || '';
     } catch (err) {
       console.warn(
-        `[warn] could not fetch metadata for ${newId} (${i}/${entries.length}): ${err?.message ?? err}`,
+        `[warn] could not fetch metadata for ${newId} (${i + 1}/${entries.length}): ${err?.message ?? err}`,
       );
     }
-    detailed.push({
+    return {
       oldId,
       newId,
       name,
       oldUrl: viewerUrlForMime(oldId, mimeType),
       newUrl: viewerUrlForMime(newId, mimeType),
-    });
-    if (REQUEST_DELAY_MS) await sleep(REQUEST_DELAY_MS);
-  }
-  return detailed;
+    };
+  });
 }
 
 // ---- Doc body walker ----
@@ -351,19 +322,31 @@ async function resolveOldId(drive, oldId, ctx) {
   if (ctx.oldIdMetaCache.has(oldId)) {
     meta = ctx.oldIdMetaCache.get(oldId);
   } else {
-    try {
-      const res = await withRetry(`files.get(old) ${oldId}`, () =>
-        drive.files.get({
-          fileId: oldId,
-          fields: 'id, name, mimeType',
-          supportsAllDrives: true,
-        }),
-      );
-      meta = { name: res.data.name || '', mimeType: res.data.mimeType || '' };
-    } catch {
-      meta = null;
+    // With DOC_CONCURRENCY docs in flight, several can want the same old id at
+    // once. The first claims the lookup and the rest await it, so a given id
+    // costs one files.get per run rather than one per doc that references it.
+    ctx.oldIdMetaInflight ??= new Map();
+    let inFlight = ctx.oldIdMetaInflight.get(oldId);
+    if (!inFlight) {
+      inFlight = (async () => {
+        try {
+          const res = await driveCall('read', `files.get(old) ${oldId}`, () =>
+            drive.files.get({
+              fileId: oldId,
+              fields: 'id, name, mimeType',
+              supportsAllDrives: true,
+            }),
+          );
+          return { name: res.data.name || '', mimeType: res.data.mimeType || '' };
+        } catch {
+          return null;
+        }
+      })();
+      ctx.oldIdMetaInflight.set(oldId, inFlight);
     }
+    meta = await inFlight;
     ctx.oldIdMetaCache.set(oldId, meta);
+    ctx.oldIdMetaInflight.delete(oldId);
   }
   if (!meta || !meta.name) return null;
 
@@ -391,7 +374,7 @@ async function resolveOldId(drive, oldId, ctx) {
 // ---- Per-doc processing ----
 export async function processDoc(docs, drive, fileEntry, ctx) {
   const idMap = ctx.idMap;
-  const docResp = await withRetry(`docs.get ${fileEntry.name}`, () =>
+  const docResp = await docsCall(`docs.get ${fileEntry.name}`, () =>
     docs.documents.get({ documentId: fileEntry.id }),
   );
   const doc = docResp.data;
@@ -590,7 +573,7 @@ export async function processDoc(docs, drive, fileEntry, ctx) {
   }
 
   if (batch1.length > 0) {
-    await withRetry(`docs.batchUpdate(styles) ${fileEntry.name}`, () =>
+    await docsCall(`docs.batchUpdate(styles) ${fileEntry.name}`, () =>
       docs.documents.batchUpdate({
         documentId: fileEntry.id,
         requestBody: { requests: batch1 },
@@ -635,7 +618,10 @@ export async function processDoc(docs, drive, fileEntry, ctx) {
         },
       ];
 
-      await withRetry(
+      // Strictly sequential within a doc: each chip edit shifts the indices of
+      // everything before it, so these must stay one-at-a-time in descending
+      // index order. The governor paces them; no fixed sleep needed.
+      await docsCall(
         `docs.batchUpdate(smartChip@${startIndex}) ${fileEntry.name}`,
         () =>
           docs.documents.batchUpdate({
@@ -643,8 +629,6 @@ export async function processDoc(docs, drive, fileEntry, ctx) {
             requestBody: { requests: chipRequests },
           }),
       );
-
-      if (REQUEST_DELAY_MS) await sleep(REQUEST_DELAY_MS);
     }
   }
 
@@ -682,7 +666,7 @@ export async function processDoc(docs, drive, fileEntry, ctx) {
       );
     }
 
-    await withRetry(`docs.batchUpdate(textReplace) ${fileEntry.name}`, () =>
+    await docsCall(`docs.batchUpdate(textReplace) ${fileEntry.name}`, () =>
       docs.documents.batchUpdate({
         documentId: fileEntry.id,
         requestBody: { requests },
@@ -821,17 +805,36 @@ async function main() {
   }
 
   console.log('📂 Scanning target folder…');
-  const { docs: allDocs, allItems } = await listTarget(drive, TARGET_FOLDER_ID);
+  console.log(
+    `   ${WALK_CONCURRENCY} walkers | rate: ${READ_RATE}→${READ_RATE_MAX}/s read (adaptive)`,
+  );
+  const { docs: allDocs, allItems } = await listTarget(
+    drive,
+    TARGET_FOLDER_ID,
+    '',
+    { docs: [], allItems: [] },
+    { onStatus: (c) => createScanStatusLogger(c, 'target') },
+  );
   console.log(
     `   Found ${allDocs.length} Google Docs (across ${allItems.length} target items)`,
   );
+
+  // A concurrent walk has no stable completion order, so fix a deterministic
+  // one for the progress counter and the per-doc log files.
+  allDocs.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
   const targetIdSet = new Set(allItems.map((i) => i.id));
 
   let sourceIdSet = new Set();
   if (SOURCE_FOLDER_ID) {
     console.log('📂 Indexing source folder (link validity: in-tree IDs are OK)…');
-    const { allItems: sourceItems } = await listTarget(drive, SOURCE_FOLDER_ID);
+    const { allItems: sourceItems } = await listTarget(
+      drive,
+      SOURCE_FOLDER_ID,
+      '',
+      { docs: [], allItems: [] },
+      { onStatus: (c) => createScanStatusLogger(c, 'source') },
+    );
     sourceIdSet = new Set(sourceItems.map((i) => i.id));
     console.log(`   ${sourceIdSet.size} items under SOURCE_FOLDER_ID`);
   }
@@ -871,8 +874,15 @@ async function main() {
   let totalFailed = 0;
   let totalResolvedByName = 0;
 
-  for (let i = 0; i < allDocs.length; i += 1) {
-    const docFile = allDocs[i];
+  // Docs are processed DOC_CONCURRENCY at a time. Each doc is still handled by
+  // the same processDoc() — index ordering and batching *within* a doc are
+  // untouched; only the outer loop is parallel. A doc that throws is recorded
+  // and the run continues.
+  console.log(
+    `\n🔗 Rewriting links in ${allDocs.length} docs — ${DOC_CONCURRENCY} at a time | docs api ${DOCS_RATE}→${DOCS_RATE_MAX}/s (adaptive)\n`,
+  );
+
+  const perDoc = await runPool(allDocs, DOC_CONCURRENCY, async (docFile, i) => {
     const progress = `[${i + 1}/${allDocs.length}]`;
     try {
       const { successReplacements, failures, modified } = await processDoc(
@@ -881,46 +891,8 @@ async function main() {
         docFile,
         ctx,
       );
-      for (const r of successReplacements) {
-        if (r.matchedBy === 'name-fallback') totalResolvedByName += 1;
-      }
-      totalLinksFound += successReplacements.length + failures.length;
-      totalReplaced += successReplacements.length;
-      totalFailed += failures.length;
 
-      const linkCandidateCount =
-        successReplacements.length + failures.length;
-      if (linkCandidateCount > 0) {
-        docsWithLinksLog.push({
-          docName: docFile.name,
-          docId: docFile.id,
-          path: docFile.path,
-          candidateLinkCount: linkCandidateCount,
-          replacedCount: successReplacements.length,
-          failedCount: failures.length,
-          replacements: successReplacements,
-          failures,
-        });
-      }
-
-      if (successReplacements.length > 0) {
-        successLog.push({
-          docName: docFile.name,
-          docId: docFile.id,
-          path: docFile.path,
-          replacements: successReplacements,
-        });
-      }
-      if (failures.length > 0) {
-        failedLog.push({
-          docName: docFile.name,
-          docId: docFile.id,
-          path: docFile.path,
-          failures,
-        });
-      }
       if (modified) {
-        modifiedPaths.push(docFile.path);
         console.log(
           `${progress} ✏️  ${docFile.path} — replaced ${successReplacements.length}, failed ${failures.length}`,
         );
@@ -931,10 +903,22 @@ async function main() {
       } else {
         console.log(`${progress} ·  ${docFile.path} — no links to update`);
       }
+
+      return { docFile, successReplacements, failures, modified };
     } catch (err) {
-      console.error(
-        `${progress} ❌ ${docFile.path}: ${err?.message ?? err}`,
-      );
+      const message = String(err?.message ?? err);
+      console.error(`${progress} ❌ ${docFile.path}: ${message}`);
+      appendIssue('doc-error', `${docFile.path}\t${message}`);
+      return { docFile, error: message };
+    }
+  });
+
+  // Aggregate in document order — runPool returns input order, so the log files
+  // do not depend on which worker happened to finish first.
+  for (const result of perDoc) {
+    const { docFile } = result;
+
+    if (result.error !== undefined) {
       failedLog.push({
         docName: docFile.name,
         docId: docFile.id,
@@ -944,14 +928,57 @@ async function main() {
             url: '',
             reason: 'PROCESSING_ERROR',
             paragraphIndex: -1,
-            textSnippet: String(err?.message ?? err),
+            textSnippet: result.error,
           },
         ],
       });
       totalFailed += 1;
+      continue;
     }
-    if (REQUEST_DELAY_MS) await sleep(REQUEST_DELAY_MS);
+
+    const { successReplacements, failures, modified } = result;
+
+    for (const r of successReplacements) {
+      if (r.matchedBy === 'name-fallback') totalResolvedByName += 1;
+    }
+    totalLinksFound += successReplacements.length + failures.length;
+    totalReplaced += successReplacements.length;
+    totalFailed += failures.length;
+
+    const linkCandidateCount = successReplacements.length + failures.length;
+    if (linkCandidateCount > 0) {
+      docsWithLinksLog.push({
+        docName: docFile.name,
+        docId: docFile.id,
+        path: docFile.path,
+        candidateLinkCount: linkCandidateCount,
+        replacedCount: successReplacements.length,
+        failedCount: failures.length,
+        replacements: successReplacements,
+        failures,
+      });
+    }
+
+    if (successReplacements.length > 0) {
+      successLog.push({
+        docName: docFile.name,
+        docId: docFile.id,
+        path: docFile.path,
+        replacements: successReplacements,
+      });
+    }
+    if (failures.length > 0) {
+      failedLog.push({
+        docName: docFile.name,
+        docId: docFile.id,
+        path: docFile.path,
+        failures,
+      });
+    }
+    if (modified) modifiedPaths.push(docFile.path);
   }
+
+  await flushIssues();
 
   // ---- Persist any name-fallback resolutions back to id-map.json + id-map-detailed.json ----
   if (ctx.fallbackResolutions.size > 0) {
@@ -1053,11 +1080,7 @@ async function main() {
   }
 }
 
-const isDirectRun =
-  process.argv[1] &&
-  fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
-
-if (isDirectRun) {
+if (isMainModule(import.meta.url)) {
   main().catch((err) => {
     console.error(err.response?.data ?? err);
     process.exit(1);

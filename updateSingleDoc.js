@@ -5,9 +5,8 @@
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { google } from 'googleapis';
-import dotenv from 'dotenv';
+import { isMainModule } from './driveUtils.js';
 import {
   authorize,
   extractDriveId,
@@ -15,8 +14,6 @@ import {
   loadOrBuildIdMap,
   processDoc,
 } from './updateDocLinks.js';
-
-dotenv.config();
 
 const DOC_MIME = 'application/vnd.google-apps.document';
 const SOURCE_FOLDER_ID = process.env.SOURCE_FOLDER_ID;
@@ -183,11 +180,7 @@ async function main() {
   console.log(`Replaced: ${totalReplaced}, Failed: ${totalFailed}`);
 }
 
-const isDirectRun =
-  process.argv[1] &&
-  fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
-
-if (isDirectRun) {
+if (isMainModule(import.meta.url)) {
   main().catch((err) => {
     console.error(err.response?.data ?? err);
     process.exit(1);

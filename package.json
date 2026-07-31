@@ -6,7 +6,9 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "verify": "node verify.js",
+    "getMissing": "node getMissing.js"
   },
   "engines": {
     "node": ">=18"

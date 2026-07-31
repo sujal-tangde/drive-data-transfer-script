@@ -20,12 +20,9 @@
  * copier, and everyone else awaits that same in-flight create (see ensureFolder).
  */
 
-import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { google } from 'googleapis';
 import fs from 'fs/promises';
 
-import dotenv from 'dotenv';
 import {
   apiStats,
   COPY_CONCURRENCY,
@@ -36,6 +33,7 @@ import {
   FOLDER_MIME,
   formatDuration,
   governors,
+  isMainModule,
   ISSUE_LOG,
   Queue,
   READ_RATE,
@@ -47,7 +45,6 @@ import {
   WRITE_RATE,
   WRITE_RATE_MAX,
 } from './driveUtils.js';
-dotenv.config();
 
 const CREDENTIALS_PATH = './credentials.json';
 const TOKEN_PATH = './token.json';
@@ -363,10 +360,7 @@ async function main() {
 }
 
 // Guarded so tests can import the pool internals without starting a copy.
-const isEntryPoint =
-  process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-
-if (isEntryPoint) {
+if (isMainModule(import.meta.url)) {
   main().catch(err => {
     console.error(err.response?.data || err);
     process.exit(1);

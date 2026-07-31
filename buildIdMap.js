@@ -3,7 +3,12 @@
  * full path (folder structure + name). This recovers the OLD_ID -> NEW_ID
  * mapping that index.js produced implicitly during migration.
  *
- * Reuses the auth + recursive-listing pattern from getMissing.js / verify.js.
+ * Read-only: files.list is the only API used.
+ *
+ * Concurrency model (shared with index.js / verify.js / getMissing.js via
+ * driveUtils.js): both trees are walked by one pool of WALK_CONCURRENCY
+ * workers, so the source and target listings overlap, and every request is
+ * paced by the adaptive read governor instead of a fixed sleep.
  *
  * Inputs (env):
  *   SOURCE_FOLDER_ID  — original folder
@@ -19,81 +24,28 @@
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { google } from 'googleapis';
-import dotenv from 'dotenv';
-dotenv.config();
+import {
+  apiStats,
+  createStatusPrinter,
+  createWalkContext,
+  flushIssues,
+  formatDuration,
+  governors,
+  isMainModule,
+  ISSUE_LOG,
+  READ_RATE,
+  READ_RATE_MAX,
+  truncateName,
+  WALK_CONCURRENCY,
+  walkTrees,
+} from './driveUtils.js';
 
 const CREDENTIALS_PATH =
   process.env.GOOGLE_OAUTH_CREDENTIALS || path.join(process.cwd(), 'credentials.json');
 const TOKEN_PATH =
   process.env.GOOGLE_OAUTH_TOKEN || path.join(process.cwd(), 'token.json');
 const ID_MAP_PATH = path.join(process.cwd(), 'id-map.json');
-
-const FOLDER_MIME = 'application/vnd.google-apps.folder';
-const REQUEST_DELAY_MS = Math.max(0, Number(process.env.DRIVE_REQUEST_DELAY_MS) || 200);
-const MAX_RETRIES = Math.max(1, Number(process.env.DRIVE_MAX_RETRIES) || 10);
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// ---- Retry helper ----
-function parseRetryAfterMs(headers) {
-  const raw = headers?.['retry-after'] ?? headers?.['Retry-After'];
-  if (raw == null) return null;
-  const sec = Number(raw);
-  if (!Number.isFinite(sec)) return null;
-  return Math.min(120_000, Math.max(0, sec * 1000));
-}
-
-function isUserRateLimitError(err) {
-  const status = err?.response?.status ?? err?.code;
-  if (status !== 403) return false;
-  const errors = err?.response?.data?.error?.errors;
-  if (Array.isArray(errors)) {
-    return errors.some(
-      (e) =>
-        e?.reason === 'userRateLimitExceeded' ||
-        e?.reason === 'rateLimitExceeded' ||
-        String(e?.message ?? '').toLowerCase().includes('rate'),
-    );
-  }
-  const msg = String(err?.response?.data?.error?.message ?? err?.message ?? '').toLowerCase();
-  return msg.includes('rate limit') || msg.includes('quota');
-}
-
-async function withRetry(label, fn) {
-  let attempt = 0;
-  let lastErr;
-  while (attempt < MAX_RETRIES) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      const status = err?.response?.status ?? err?.code;
-      const rl403 = isUserRateLimitError(err);
-      const retryable =
-        status === 429 ||
-        rl403 ||
-        status === 500 ||
-        status === 502 ||
-        status === 503 ||
-        status === 504 ||
-        err?.message?.includes?.('ECONNRESET') ||
-        err?.message?.includes?.('ETIMEDOUT');
-      if (!retryable || attempt === MAX_RETRIES - 1) throw err;
-      const fromHeader = parseRetryAfterMs(err?.response?.headers);
-      const base = rl403 ? 2000 * 2 ** attempt : 500 * 2 ** attempt;
-      const backoff = fromHeader ?? Math.min(rl403 ? 120_000 : 60_000, base);
-      const jitter = Math.floor(Math.random() * (rl403 ? 2000 : 250));
-      console.warn(
-        `[retry] ${label} failed (${status ?? err?.message}). Waiting ${backoff + jitter}ms (attempt ${attempt + 1}/${MAX_RETRIES})`,
-      );
-      await sleep(backoff + jitter);
-      attempt += 1;
-    }
-  }
-  throw lastErr;
-}
 
 // ---- Auth (same pattern as getMissing.js) ----
 export async function authorize() {
@@ -110,7 +62,59 @@ export async function authorize() {
   return oAuth2Client;
 }
 
-// ---- Recursive listing: returns Maps keyed by full slash-path ----
+/**
+ * Walks one or more trees concurrently, returning per-side Maps keyed by full
+ * slash-path. First entry wins for a given path, matching the old recursive
+ * walker's `if (!map.has(path))` behaviour.
+ *
+ * @param {import('googleapis').drive_v3.Drive} drive
+ * @param {Array<{side: string, id: string, prefix?: string, files?: Map, folders?: Map}>} roots
+ * @returns {Promise<{collected: Record<string, {files: Map, folders: Map}>, ctx: object}>}
+ */
+async function mapTrees(drive, roots, { onStatus } = {}) {
+  const collected = {};
+  const scan = {};
+  for (const r of roots) {
+    collected[r.side] = { files: r.files ?? new Map(), folders: r.folders ?? new Map() };
+    scan[r.side] = { folders: 0, files: 0 };
+  }
+
+  const ctx = createWalkContext({
+    scan,
+    onFile(side, fullPath, f) {
+      const { files } = collected[side];
+      if (!files.has(fullPath)) {
+        files.set(fullPath, { id: f.id, name: f.name, mimeType: f.mimeType });
+      }
+    },
+    onFolder(side, fullPath, f) {
+      const { folders } = collected[side];
+      if (!folders.has(fullPath)) {
+        folders.set(fullPath, { id: f.id, name: f.name });
+      }
+    },
+  });
+
+  const status = onStatus ? onStatus(ctx) : null;
+  status?.start();
+  try {
+    await walkTrees(
+      drive,
+      roots.map((r) => ({ side: r.side, id: r.id, path: r.prefix ?? '' })),
+      ctx,
+    );
+    ctx.done = true;
+  } finally {
+    status?.stop();
+  }
+
+  return { collected, ctx };
+}
+
+/**
+ * Single-tree listing keyed by full slash-path. Kept for API compatibility —
+ * `buildIdMap` walks both trees together instead of calling this twice.
+ */
 export async function mapAll(
   drive,
   folderId,
@@ -118,38 +122,34 @@ export async function mapAll(
   files = new Map(),
   folders = new Map(),
 ) {
-  let pageToken;
-  do {
-    const res = await withRetry('files.list', () =>
-      drive.files.list({
-        q: `'${folderId}' in parents and trashed = false`,
-        fields: 'nextPageToken, files(id, name, mimeType)',
-        pageSize: 1000,
-        pageToken,
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-      }),
-    );
+  const { collected } = await mapTrees(drive, [
+    { side: 'root', id: folderId, prefix, files, folders },
+  ]);
+  return collected.root;
+}
 
-    for (const f of res.data.files || []) {
-      if (!f.id || !f.name) continue;
-      const fullPath = prefix ? `${prefix}/${f.name}` : f.name;
-      if (f.mimeType === FOLDER_MIME) {
-        if (!folders.has(fullPath)) {
-          folders.set(fullPath, { id: f.id, name: f.name });
-        }
-        await mapAll(drive, f.id, fullPath, files, folders);
-      } else {
-        if (!files.has(fullPath)) {
-          files.set(fullPath, { id: f.id, name: f.name, mimeType: f.mimeType });
-        }
-      }
-    }
-    pageToken = res.data.nextPageToken;
-    if (REQUEST_DELAY_MS) await sleep(REQUEST_DELAY_MS);
-  } while (pageToken);
+/** Two-line status block: [progress] per-tree counts, [scan] queue + API health. */
+function createStatusLogger(ctx, sides) {
+  const startedAt = Date.now();
 
-  return { files, folders };
+  return createStatusPrinter(() => {
+    const progress = sides.map((side, i) => {
+      const s = ctx.scan[side];
+      return `${i === 0 ? '[progress] ' : ''}${side} ${s.files} files / ${s.folders} folders`;
+    });
+    if (ctx.stats.errors) progress.push(`${ctx.stats.errors} errors`);
+    progress.push(`elapsed ${formatDuration(Date.now() - startedAt)}`);
+
+    const scan = [
+      ctx.done ? '[scan] mapping complete' : '[scan] mapping…',
+      `queue: ${ctx.queues.folders.size} folders`,
+      `api ${governors.read.rate.toFixed(1)}/s read`,
+    ];
+    if (apiStats.retries) scan.push(`${apiStats.retries} retries`);
+    scan.push(`in: ${truncateName(ctx.runtime.currentFolder || '/', 40)}`);
+
+    return [progress.join(' | '), scan.join(' | ')];
+  });
 }
 
 /**
@@ -175,13 +175,37 @@ export async function buildIdMap(drive, opts) {
     throw new Error('buildIdMap: sourceFolderId and targetFolderId are required');
   }
 
+  // Both trees share one walker pool, so the two listings overlap.
   console.log('📂 Mapping source…');
-  const { files: srcFiles, folders: srcFolders } = await mapAll(drive, sourceFolderId);
-  console.log(`   Source: ${srcFiles.size} files, ${srcFolders.size} folders`);
-
   console.log('📂 Mapping target…');
-  const { files: tgtFiles, folders: tgtFolders } = await mapAll(drive, targetFolderId);
+  console.log(
+    `   ${WALK_CONCURRENCY} walkers | rate: ${READ_RATE}→${READ_RATE_MAX}/s read (adaptive)`,
+  );
+
+  const { collected, ctx } = await mapTrees(
+    drive,
+    [
+      { side: 'source', id: sourceFolderId },
+      { side: 'target', id: targetFolderId },
+    ],
+    { onStatus: (c) => createStatusLogger(c, ['source', 'target']) },
+  );
+
+  const { files: srcFiles, folders: srcFolders } = collected.source;
+  const { files: tgtFiles, folders: tgtFolders } = collected.target;
+
+  console.log(`   Source: ${srcFiles.size} files, ${srcFolders.size} folders`);
   console.log(`   Target: ${tgtFiles.size} files, ${tgtFolders.size} folders`);
+
+  if (ctx.stats.errors) {
+    // A folder we could not list means its paths were never seen, so anything
+    // under it would be reported as unmatched rather than genuinely missing.
+    console.log(
+      `\n⚠️  ${ctx.stats.errors} folders could not be listed — the map is INCOMPLETE (see ${ISSUE_LOG})`,
+    );
+    for (const line of ctx.failures.slice(0, 10)) console.log(`  - ${line}`);
+  }
+  await flushIssues();
 
   /** @type {Record<string, string>} */
   const idMap = {};
@@ -262,10 +286,7 @@ async function main() {
   });
 }
 
-const isDirectRun =
-  process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
-
-if (isDirectRun) {
+if (isMainModule(import.meta.url)) {
   main().catch((err) => {
     console.error(err.response?.data ?? err);
     process.exit(1);

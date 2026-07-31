@@ -105,17 +105,22 @@ Do not pass both `--continue-if-incomplete` and `--continue-with-re-copy`.
 | `FILE_QUEUE_MAX` | `20000` | Backpressure cap on queued-but-uncopied files |
 | `DRIVE_MAX_RETRIES` | `10` | Retries for 429 / rate-limit 403 / 5xx / network errors |
 | `LOG_INTERVAL_MS` | `1000` | How often the two-line status block is printed (min `200`) |
-| `MAX_WALK_DEPTH` | `100` | Depth cap for the path walk in `verify.js` / `getMissing.js` |
+| `MAX_WALK_DEPTH` | `100` | Depth cap for the path walk in `verify.js` / `getMissing.js` / `buildIdMap.js` / `updateDocLinks.js` |
+| `DOC_CONCURRENCY` | `4` | Google Docs processed at once by `updateDocLinks.js` (max `8`) |
+| `DOCS_RATE` / `DOCS_RATE_MAX` | `3` / `8` | Docs API requests per second: starting rate and ceiling |
 | `VERBOSE` | — | Set to `1` for verbose logs |
 | `ID_MAP_PATH` | `./id-map.json` | Path used by link-rewrite scripts |
 | `FORCE_REBUILD_DETAILED_MAP` | — | Set to `1` to rebuild `id-map-detailed.json` |
 
-The concurrency, rate, retry and logging variables apply to **`index.js`, `verify.js` and `getMissing.js` alike** — all three share `driveUtils.js`, so tuning `READ_RATE` once changes every script. Two exceptions:
+The concurrency, rate, retry and logging variables apply to **every script** — `index.js`, `verify.js`, `getMissing.js`, `buildIdMap.js` and `updateDocLinks.js` all share `driveUtils.js`, so tuning `READ_RATE` once changes all of them. Exceptions:
 
 - `FILE_QUEUE_MAX` only affects `index.js`. It exists to stop walkers outrunning copiers, and only `index.js` overlaps those two phases (see below).
-- `COPY_CONCURRENCY` does nothing in `verify.js`, which never writes.
+- `COPY_CONCURRENCY` does nothing in `verify.js`, `buildIdMap.js` or `updateDocLinks.js`, none of which copy files.
+- `DOC_CONCURRENCY`, `DOCS_RATE` and `DOCS_RATE_MAX` only affect `updateDocLinks.js` (and `updateSingleDoc.js`, which processes one doc).
 
-`DRIVE_REQUEST_DELAY_MS` and `SCAN_REQUEST_DELAY_MS` are retired everywhere — no script sleeps a fixed amount between calls any more. Pacing is the adaptive governor's job.
+The **Docs API has its own governor**, separate from the Drive read/write buckets. Docs quota is much tighter than Drive's, and the two must not throttle each other: a Docs 429 slows only doc rewriting, and a Drive 429 slows only listing. Defaults are deliberately conservative.
+
+`DRIVE_REQUEST_DELAY_MS` and `SCAN_REQUEST_DELAY_MS` are retired **everywhere, including `buildIdMap.js` and `updateDocLinks.js`** — no script sleeps a fixed amount after a successful call any more. Pacing is the adaptive governor's job. Setting them has no effect.
 
 ## Typical workflow
 
@@ -182,6 +187,27 @@ node updateSingleDoc.js "https://docs.google.com/document/d/DOC_ID/edit"
 
 Smart chips (rich links) are replaced by deleting the chip and inserting a normal hyperlink (Docs API limitation).
 
+#### `buildIdMap.js`
+
+**Read-only** (`files.list` only). Source and target are walked **concurrently in one pool of `WALK_CONCURRENCY` workers** and paced by the adaptive read governor, with a two-line status block while mapping. Matching is by full slash-path, exactly as before; `id-map.json` is still `{ sourceId: targetId }` covering both files and folders, and unmatched source files/folders are still reported.
+
+The module API is unchanged — `authorize()`, `buildIdMap(drive, { sourceFolderId, targetFolderId, outputPath, write })` and `mapAll()` all keep their signatures, so `updateDocLinks.js`'s auto-build path still works. If any folder fails to list, the run says so and the map is flagged INCOMPLETE (paths under an unlistable folder would otherwise be reported as unmatched).
+
+#### `updateDocLinks.js`
+
+Two phases, both faster:
+
+1. **Scan** — the target tree (and the source tree, when `SOURCE_FOLDER_ID` is set) is walked by `WALK_CONCURRENCY` workers instead of one sequential recursion. Still a single pass collecting both the Google Docs list and every item, since the name-fallback resolver needs a name-index of the whole tree.
+2. **Rewrite** — up to `DOC_CONCURRENCY` docs are processed at once.
+
+**Per-document behaviour is unchanged.** Each doc still goes through the same `processDoc()`: the same non-shifting batch first, then smart-chip edits applied strictly one at a time in descending index order (they shift the indices of everything before them), then text replacements. Only the *outer* loop over documents is parallel. A doc that throws is logged to `failed.json` as `PROCESSING_ERROR` and to `logs/issues.log`, and the run continues.
+
+Documents are processed in sorted path order and the log files are written in that same order regardless of which worker finished first — the previous DFS order depended on the order Drive returned children, which is not guaranteed stable between runs.
+
+Old-ID metadata lookups are shared across concurrent docs: the first document to need an unknown ID owns the `files.get` and the rest await it, so an ID referenced by 50 docs costs one lookup, not 50.
+
+`id-map-detailed.json` is built concurrently too (one `files.get` per entry through the read governor) and keeps the same entry order as the id-map it came from.
+
 ## Behavior notes
 
 - **Source is read-only** for migration: list + copy only. Deletes (in `--continue-with-re-copy`) apply only to duplicate files in the **target**.
@@ -191,7 +217,7 @@ Smart chips (rich links) are replaced by deleting the chip and inserting a norma
 - Status is printed as a two-line block once per second (`[progress]` + `[scan]`). Totals and ETA firm up as the walk discovers the tree; percentages are prefixed `~` until discovery finishes.
 - **Concurrent**, with duplicate-safety by construction: a folder queue is drained by `WALK_CONCURRENCY` walkers, and each source folder is enqueued exactly once, so exactly one worker ever writes into a given target folder. Walkers feed a file queue drained by `COPY_CONCURRENCY` copiers, overlapping traversal with copying.
 - **Rate limits** are handled by an adaptive governor with separate read/write token buckets. A 403/429 cuts the rate for every worker at once (coalesced, so one episode is one cut) and the rate creeps back up once things are calm. You should not need to tune this by hand. The governor is process-wide, so running `index.js` and `getMissing.js` at the same time does **not** coordinate them — they will each push their own rate up and compete for the same quota.
-- **Shared plumbing**: `index.js`, `verify.js` and `getMissing.js` all import the governor, retry policy, queue, paginated listing and status block from `driveUtils.js`, so tuning or fixing any of it applies everywhere instead of drifting between three copies.
+- **Shared plumbing**: every script (`index.js`, `verify.js`, `getMissing.js`, `buildIdMap.js`, `updateDocLinks.js`, `updateSingleDoc.js`) imports the governor, retry policy, queue, paginated listing, concurrent walker and status block from `driveUtils.js`, so tuning or fixing any of it applies everywhere instead of drifting between copies.
 - **Path matching vs. name matching**: `index.js` walks and dedupes by folder **id** (it copies each folder once). `verify.js` and `getMissing.js` compare by **full path**, so a folder reachable by two paths is two entries and is walked once per distinct path; their visit key is `(id, path)`. `MAX_WALK_DEPTH` bounds that walk in case a pathological multi-parent graph nests without end.
 - **Shortcuts** are counted as ordinary files by `verify.js` / `getMissing.js`, because a shortcut occupies a path. Since `index.js` does not copy shortcuts, source shortcuts legitimately show up as missing in `verify.js`; the count is reported separately at the end.
 - **Only one run at a time**: `.migrate.lock` prevents two concurrent migrations, which would each duplicate what the other creates. Delete it manually if a process died hard.
