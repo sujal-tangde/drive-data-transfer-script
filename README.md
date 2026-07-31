@@ -11,6 +11,7 @@ After migration, companion scripts can **verify** the copy, **rebuild an old→n
 | `index.js` | Main recursive copy (resume-safe) |
 | `verify.js` | Compare source vs target by path; list missing / extra files |
 | `getMissing.js` | Copy only files missing from the target (by path) |
+| `driveUtils.js` | Shared plumbing: rate governor, retries, queue, walker, status block |
 | `buildIdMap.js` | Build `id-map.json` (`sourceId` → `targetId`) by matching paths |
 | `updateDocLinks.js` | Rewrite old Drive links in all Docs under the target folder |
 | `updateSingleDoc.js` | Same link rewrite for one Doc URL |
@@ -104,9 +105,17 @@ Do not pass both `--continue-if-incomplete` and `--continue-with-re-copy`.
 | `FILE_QUEUE_MAX` | `20000` | Backpressure cap on queued-but-uncopied files |
 | `DRIVE_MAX_RETRIES` | `10` | Retries for 429 / rate-limit 403 / 5xx / network errors |
 | `LOG_INTERVAL_MS` | `1000` | How often the two-line status block is printed (min `200`) |
+| `MAX_WALK_DEPTH` | `100` | Depth cap for the path walk in `verify.js` / `getMissing.js` |
 | `VERBOSE` | — | Set to `1` for verbose logs |
 | `ID_MAP_PATH` | `./id-map.json` | Path used by link-rewrite scripts |
 | `FORCE_REBUILD_DETAILED_MAP` | — | Set to `1` to rebuild `id-map-detailed.json` |
+
+The concurrency, rate, retry and logging variables apply to **`index.js`, `verify.js` and `getMissing.js` alike** — all three share `driveUtils.js`, so tuning `READ_RATE` once changes every script. Two exceptions:
+
+- `FILE_QUEUE_MAX` only affects `index.js`. It exists to stop walkers outrunning copiers, and only `index.js` overlaps those two phases (see below).
+- `COPY_CONCURRENCY` does nothing in `verify.js`, which never writes.
+
+`DRIVE_REQUEST_DELAY_MS` and `SCAN_REQUEST_DELAY_MS` are retired everywhere — no script sleeps a fixed amount between calls any more. Pacing is the adaptive governor's job.
 
 ## Typical workflow
 
@@ -126,6 +135,12 @@ node verify.js
 
 Lists files present in source but missing in target (and extras in target), matched by full path.
 
+**Read-only** — it never copies, creates or deletes, and only ever charges the read quota. Both trees are walked **concurrently in one pool of `WALK_CONCURRENCY` workers**, so the source and target listings overlap instead of running one after the other. Progress is a two-line status block (`[progress]` per-tree counts + `[scan]` queue and API health).
+
+Missing/extra lists are **sorted** rather than printed in traversal order: a concurrent walk has no stable order between runs, and sorting groups each folder's files together.
+
+If any folder cannot be listed, the failure goes to `logs/issues.log`, the walk continues, and the run ends with a loud `results are INCOMPLETE` warning plus a non-zero exit — an unreadable folder means its files were never seen, so they would otherwise be silently reported as missing.
+
 ### 3. Copy only missing files (optional)
 
 ```bash
@@ -133,6 +148,17 @@ node getMissing.js
 ```
 
 Maps both trees by path and copies only what is still missing (creates missing folders as needed). Prefer `index.js --continue-if-incomplete` for most resume cases.
+
+Runs in two phases:
+
+1. **Map** — both trees walked concurrently by `WALK_CONCURRENCY` workers, building path → file maps and a path → folder-id cache of what already exists in the target.
+2. **Copy** — `COPY_CONCURRENCY` workers drain the missing-file queue.
+
+The phases do not overlap, unlike `index.js`: a source file is only "missing" once the *entire* target map is known, so neither the missing count nor any copy can be decided before both walks finish. (`index.js` can overlap because it decides folder by folder, from a listing it already has in hand.)
+
+Folder creation is safe under concurrency: the first copier to need a path owns its creation and every other copier awaits that same in-flight create, so `COPY_CONCURRENCY` workers racing into the same new folder still create it exactly once. Existing target folders are reused from the pre-seeded cache and never duplicated.
+
+If the mapping phase hits a folder it cannot list, the script **stops before copying anything** — an incomplete target map would make already-copied files look missing and copy them a second time. Failures during the copy phase are logged per file and do not abort the run; re-running retries them.
 
 ### 4. Build ID map + rewrite Doc links (optional)
 
@@ -164,7 +190,10 @@ Smart chips (rich links) are replaced by deleting the chip and inserting a norma
 - Existing **folders** in the target with the same name are reused (not duplicated).
 - Status is printed as a two-line block once per second (`[progress]` + `[scan]`). Totals and ETA firm up as the walk discovers the tree; percentages are prefixed `~` until discovery finishes.
 - **Concurrent**, with duplicate-safety by construction: a folder queue is drained by `WALK_CONCURRENCY` walkers, and each source folder is enqueued exactly once, so exactly one worker ever writes into a given target folder. Walkers feed a file queue drained by `COPY_CONCURRENCY` copiers, overlapping traversal with copying.
-- **Rate limits** are handled by an adaptive governor with separate read/write token buckets. A 403/429 cuts the rate for every worker at once (coalesced, so one episode is one cut) and the rate creeps back up once things are calm. You should not need to tune this by hand.
+- **Rate limits** are handled by an adaptive governor with separate read/write token buckets. A 403/429 cuts the rate for every worker at once (coalesced, so one episode is one cut) and the rate creeps back up once things are calm. You should not need to tune this by hand. The governor is process-wide, so running `index.js` and `getMissing.js` at the same time does **not** coordinate them — they will each push their own rate up and compete for the same quota.
+- **Shared plumbing**: `index.js`, `verify.js` and `getMissing.js` all import the governor, retry policy, queue, paginated listing and status block from `driveUtils.js`, so tuning or fixing any of it applies everywhere instead of drifting between three copies.
+- **Path matching vs. name matching**: `index.js` walks and dedupes by folder **id** (it copies each folder once). `verify.js` and `getMissing.js` compare by **full path**, so a folder reachable by two paths is two entries and is walked once per distinct path; their visit key is `(id, path)`. `MAX_WALK_DEPTH` bounds that walk in case a pathological multi-parent graph nests without end.
+- **Shortcuts** are counted as ordinary files by `verify.js` / `getMissing.js`, because a shortcut occupies a path. Since `index.js` does not copy shortcuts, source shortcuts legitimately show up as missing in `verify.js`; the count is reported separately at the end.
 - **Only one run at a time**: `.migrate.lock` prevents two concurrent migrations, which would each duplicate what the other creates. Delete it manually if a process died hard.
 - **Failures do not abort the run.** Per-file and per-folder errors are logged to `logs/issues.log` (along with skipped shortcuts and ambiguous folder names), and the process exits non-zero so you know to re-run with `--continue-if-incomplete`.
 - **Ctrl+C** stops cleanly after in-flight requests finish; press it twice to force quit.

@@ -29,12 +29,34 @@ import { fileURLToPath } from 'node:url';
 import { stdin as input, stdout as output } from 'node:process';
 import { google } from 'googleapis';
 import dotenv from 'dotenv';
+import {
+  apiStats,
+  appendIssue,
+  COPY_CONCURRENCY,
+  createStatusPrinter,
+  driveCall,
+  FILE_QUEUE_MAX,
+  flushIssues,
+  FOLDER_MIME,
+  formatDuration,
+  governors,
+  ISSUE_LOG,
+  listChildren,
+  LOG_INTERVAL_MS,
+  Queue,
+  RateGovernor,
+  READ_RATE,
+  READ_RATE_MAX,
+  recordFailure,
+  SHORTCUT_MIME,
+  sleep,
+  truncateName,
+  VERBOSE,
+  WALK_CONCURRENCY,
+  WRITE_RATE,
+  WRITE_RATE_MAX,
+} from './driveUtils.js';
 dotenv.config();
-
-const VERBOSE =
-  process.argv.includes('--verbose') ||
-  process.argv.includes('-v') ||
-  process.env.VERBOSE === '1';
 
 const WANT_CONTINUE_IF_INCOMPLETE = process.argv.includes('--continue-if-incomplete');
 const WANT_CONTINUE_WITH_RE_COPY = process.argv.includes('--continue-with-re-copy');
@@ -59,7 +81,6 @@ const CREDENTIALS_PATH =
   process.env.GOOGLE_OAUTH_CREDENTIALS || path.join(process.cwd(), 'credentials.json');
 const TOKEN_PATH = process.env.GOOGLE_OAUTH_TOKEN || path.join(process.cwd(), 'token.json');
 const LOCK_PATH = path.join(process.cwd(), '.migrate.lock');
-const ISSUE_LOG = path.join(process.cwd(), 'logs', 'issues.log');
 
 console.log({
   CREDENTIALS_PATH,
@@ -67,253 +88,6 @@ console.log({
   TARGET_FOLDER_ID,
   TOKEN_PATH
 })
-
-/** Reads a positive number from env, falling back when unset/blank/invalid. */
-function envNum(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
-  const raw = process.env[name];
-  if (raw == null || raw === '') return fallback;
-  const n = Number(raw);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.min(max, Math.max(min, n));
-}
-
-/** Folder-walker workers (listing-heavy, mostly read quota). */
-const WALK_CONCURRENCY = Math.floor(envNum('WALK_CONCURRENCY', 6, { min: 1, max: 32 }));
-/** File-copy workers (write quota). */
-const COPY_CONCURRENCY = Math.floor(envNum('COPY_CONCURRENCY', 8, { min: 1, max: 32 }));
-
-/** Starting/ceiling request rates per second. AIMD moves between them at runtime. */
-const READ_RATE = envNum('READ_RATE', 15, { min: 0.5, max: 200 });
-const READ_RATE_MAX = Math.max(READ_RATE, envNum('READ_RATE_MAX', 40, { min: 0.5, max: 400 }));
-const WRITE_RATE = envNum('WRITE_RATE', 6, { min: 0.2, max: 200 });
-const WRITE_RATE_MAX = Math.max(WRITE_RATE, envNum('WRITE_RATE_MAX', 20, { min: 0.2, max: 400 }));
-
-/** Cap on queued-but-uncopied files, so walkers cannot outrun copiers unboundedly. */
-const FILE_QUEUE_MAX = Math.floor(envNum('FILE_QUEUE_MAX', 20_000, { min: 100 }));
-
-/** Max retries per API call for transient errors. */
-const MAX_RETRIES = Math.max(1, Math.floor(envNum('DRIVE_MAX_RETRIES', 10, { min: 1, max: 50 })));
-
-/** How often the two-line status block is printed (ms). */
-const LOG_INTERVAL_MS = envNum('LOG_INTERVAL_MS', 1000, { min: 200, max: 60_000 });
-
-const FOLDER_MIME = 'application/vnd.google-apps.folder';
-const SHORTCUT_MIME = 'application/vnd.google-apps.shortcut';
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function truncateName(name, max = 45) {
-  const s = String(name ?? '');
-  if (s.length <= max) return s;
-  return `${s.slice(0, max - 1)}…`;
-}
-
-function formatDuration(ms) {
-  const total = Math.max(0, Math.floor(ms / 1000));
-  const h = String(Math.floor(total / 3600)).padStart(2, '0');
-  const m = String(Math.floor((total % 3600) / 60)).padStart(2, '0');
-  const s = String(total % 60).padStart(2, '0');
-  return `${h}:${m}:${s}`;
-}
-
-/**
- * Token bucket with additive-increase / multiplicative-decrease adaptation.
- *
- * Rate and concurrency are deliberately separate concerns: workers exist to hide
- * round-trip latency, this exists to keep total requests/sec under whatever
- * Drive is willing to serve right now. Because every worker draws from the same
- * bucket, a penalty applies to all of them at once.
- */
-class RateGovernor {
-  constructor(name, { rate, maxRate, minRate }) {
-    this.name = name;
-    this.rate = rate;
-    this.maxRate = maxRate;
-    this.minRate = minRate;
-    this.step = Math.max(0.5, maxRate * 0.05);
-    this.burst = Math.max(1, Math.min(rate, 10));
-    this.tokens = this.burst;
-    this.last = Date.now();
-    this.pausedUntil = 0;
-    this.lastPenaltyAt = 0;
-    this.lastRaiseAt = 0;
-    this.penalties = 0;
-  }
-
-  async take() {
-    for (;;) {
-      const now = Date.now();
-      if (now < this.pausedUntil) {
-        await sleep(Math.min(1000, this.pausedUntil - now));
-        continue;
-      }
-      const elapsedSec = (now - this.last) / 1000;
-      if (elapsedSec > 0) {
-        this.tokens = Math.min(this.burst, this.tokens + elapsedSec * this.rate);
-        this.last = now;
-      }
-      if (this.tokens >= 1) {
-        this.tokens -= 1;
-        return;
-      }
-      const waitMs = Math.ceil(((1 - this.tokens) / this.rate) * 1000);
-      await sleep(Math.max(5, Math.min(500, waitMs)));
-    }
-  }
-
-  /** Drive pushed back: cut the rate and stall every worker for pauseMs. */
-  penalize(pauseMs = 0) {
-    const now = Date.now();
-    // Every in-flight worker reports the same throttling episode, so cut the
-    // rate only once per pause window. Without this, N workers each apply
-    // ×0.6 and the rate collapses by 0.6^N from a single episode.
-    if (now >= this.pausedUntil) {
-      this.rate = Math.max(this.minRate, this.rate * 0.6);
-      this.burst = Math.max(1, Math.min(this.rate, 10));
-      this.penalties += 1;
-    }
-    this.tokens = 0;
-    this.lastPenaltyAt = now;
-    this.pausedUntil = Math.max(this.pausedUntil, now + pauseMs);
-  }
-
-  /**
-   * Creep back toward the ceiling once things have been calm for a while.
-   * Time-based rather than success-count-based: a steady trickle of unrelated
-   * errors must not pin the rate at the floor forever.
-   */
-  reward() {
-    if (this.rate >= this.maxRate) return;
-    const now = Date.now();
-    if (now - this.lastPenaltyAt < 5000) return;
-    if (now - this.lastRaiseAt < 2000) return;
-    this.lastRaiseAt = now;
-    this.rate = Math.min(this.maxRate, this.rate + this.step);
-    this.burst = Math.max(1, Math.min(this.rate, 10));
-  }
-}
-
-// Floors are deliberately not tiny: a governor pinned at 0.2/s would turn a
-// 30k-file migration into days. Sustained failure should surface as errors.
-const governors = {
-  read: new RateGovernor('read', { rate: READ_RATE, maxRate: READ_RATE_MAX, minRate: 1 }),
-  write: new RateGovernor('write', { rate: WRITE_RATE, maxRate: WRITE_RATE_MAX, minRate: 0.5 }),
-};
-
-/** FIFO with amortized O(1) dequeue — plain Array#shift is O(n) at 30k+ jobs. */
-class Queue {
-  constructor() {
-    this.items = [];
-    this.head = 0;
-  }
-
-  push(item) {
-    this.items.push(item);
-  }
-
-  shift() {
-    if (this.head >= this.items.length) return undefined;
-    const value = this.items[this.head];
-    this.items[this.head] = undefined;
-    this.head += 1;
-    if (this.head > 4096 && this.head * 2 > this.items.length) {
-      this.items = this.items.slice(this.head);
-      this.head = 0;
-    }
-    return value;
-  }
-
-  get size() {
-    return this.items.length - this.head;
-  }
-}
-
-function parseRetryAfterMs(headers) {
-  const raw = headers?.['retry-after'] ?? headers?.['Retry-After'];
-  if (raw == null) return null;
-  const sec = Number(raw);
-  if (!Number.isFinite(sec)) return null;
-  return Math.min(120_000, Math.max(0, sec * 1000));
-}
-
-function isUserRateLimitError(err) {
-  const status = err?.response?.status ?? err?.code;
-  if (status !== 403) return false;
-  const msg = String(err?.response?.data?.error?.message ?? err?.message ?? '').toLowerCase();
-  if (msg.includes('rate limit') || msg.includes('quota')) return true;
-  const errors = err?.response?.data?.error?.errors;
-  if (Array.isArray(errors)) {
-    return errors.some(
-      (e) =>
-        e?.reason === 'userRateLimitExceeded' ||
-        e?.reason === 'rateLimitExceeded' ||
-        String(e?.message ?? '').toLowerCase().includes('rate'),
-    );
-  }
-  return false;
-}
-
-/** Retry noise is throttled — 14 workers hitting one limit must not spam 14 lines. */
-const limitLog = { last: 0 };
-function noteThrottle(message) {
-  const now = Date.now();
-  if (now - limitLog.last < 3000) return;
-  limitLog.last = now;
-  console.log(`[limit] ${message}`);
-}
-
-const apiStats = { retries: 0, calls: 0 };
-
-/**
- * Single entry point for every Drive request: rate-governed, retried, and
- * self-throttling. `kind` selects which quota bucket the call is charged to.
- */
-async function driveCall(kind, label, fn) {
-  const gov = governors[kind];
-  let attempt = 0;
-  let lastErr;
-
-  while (attempt < MAX_RETRIES) {
-    await gov.take();
-    try {
-      const res = await fn();
-      apiStats.calls += 1;
-      gov.reward();
-      return res;
-    } catch (err) {
-      lastErr = err;
-      const status = err?.response?.status ?? err?.code;
-      const rateLimited = status === 429 || isUserRateLimitError(err);
-      const retryable =
-        rateLimited ||
-        status === 500 ||
-        status === 502 ||
-        status === 503 ||
-        status === 504 ||
-        err?.message?.includes?.('ECONNRESET') ||
-        err?.message?.includes?.('ETIMEDOUT') ||
-        err?.message?.includes?.('EAI_AGAIN') ||
-        err?.message?.includes?.('socket hang up');
-
-      if (!retryable || attempt === MAX_RETRIES - 1) throw err;
-
-      apiStats.retries += 1;
-      const fromHeader = parseRetryAfterMs(err?.response?.headers);
-
-      if (rateLimited) {
-        // Global penalty: every worker on this bucket slows down together.
-        const pause = fromHeader ?? Math.min(60_000, 1000 * 2 ** attempt);
-        gov.penalize(pause);
-        noteThrottle(`${kind} rate cut to ${gov.rate.toFixed(1)}/s (${status}); pausing ${pause}ms`);
-      } else {
-        const backoff = fromHeader ?? Math.min(30_000, 500 * 2 ** attempt);
-        await sleep(backoff + Math.floor(Math.random() * 250));
-      }
-      attempt += 1;
-    }
-  }
-  throw lastErr;
-}
 
 async function loadSavedCredentials() {
   try {
@@ -448,52 +222,6 @@ async function releaseLock() {
   await fs.rm(LOCK_PATH, { force: true }).catch(() => {});
 }
 
-/** Serialized appends so concurrent workers cannot interleave a log line. */
-let logDirReady = null;
-let issueLogChain = Promise.resolve();
-function appendIssue(kind, detail) {
-  logDirReady ??= fs.mkdir(path.dirname(ISSUE_LOG), { recursive: true }).catch(() => {});
-  const line = `${new Date().toISOString()}\t${kind}\t${detail}\n`;
-  issueLogChain = issueLogChain
-    .then(() => logDirReady)
-    .then(() => fs.appendFile(ISSUE_LOG, line, 'utf8'))
-    .catch(() => {});
-  return issueLogChain;
-}
-
-function recordFailure(ctx, label, err) {
-  const message = String(
-    err?.response?.data?.error?.message ?? err?.message ?? err,
-  ).replace(/\s+/g, ' ');
-  ctx.stats.errors += 1;
-  if (ctx.failures.length < 50) ctx.failures.push(`${label}: ${message}`);
-  appendIssue('error', `${label}\t${message}`);
-}
-
-async function listChildren(drive, folderId) {
-  const q = `'${folderId}' in parents and trashed = false`;
-  const all = [];
-  let pageToken;
-
-  do {
-    const res = await driveCall('read', `files.list ${folderId}`, () =>
-      drive.files.list({
-        q,
-        pageSize: 1000,
-        pageToken: pageToken || undefined,
-        fields: 'nextPageToken, files(id, name, mimeType, shortcutDetails)',
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-      }),
-    );
-    const files = res.data.files ?? [];
-    for (const f of files) all.push(f);
-    pageToken = res.data.nextPageToken;
-  } while (pageToken);
-
-  return all;
-}
-
 /**
  * Deletes a duplicate file in the TARGET folder only (never the source).
  * @param {import('googleapis').drive_v3.Drive} drive
@@ -523,9 +251,8 @@ function progressDoneCount(stats) {
  */
 function createStatusLogger(stats, walkState, runtime, queues) {
   const startedAt = Date.now();
-  let timer = null;
 
-  const tick = () => {
+  return createStatusPrinter(() => {
     const processed = progressDoneCount(stats);
     const elapsedMs = Date.now() - startedAt;
     const rate = processed / Math.max(1, elapsedMs / 1000);
@@ -561,38 +288,8 @@ function createStatusLogger(stats, walkState, runtime, queues) {
     if (runtime.currentFolder) scan.push(`in: ${truncateName(runtime.currentFolder, 26)}`);
     scan.push(`now: ${truncateName(runtime.currentFile, 34)}`);
 
-    const progressLine = progress.join(' | ');
-    const scanLine = scan.join(' | ');
-    // Rule spans the widest line so each tick reads as one block; recomputed
-    // every tick so a terminal resize is picked up.
-    const rule = '-'.repeat(
-      Math.min(
-        Math.max(progressLine.length, scanLine.length),
-        (process.stdout.columns || 120) - 1,
-      ),
-    );
-
-    console.log(rule);
-    console.log(progressLine);
-    console.log(scanLine);
-    console.log(rule);
-  };
-
-  return {
-    start() {
-      if (timer) return;
-      tick();
-      timer = setInterval(tick, LOG_INTERVAL_MS);
-      timer.unref?.();
-    },
-    stop() {
-      if (timer) {
-        clearInterval(timer);
-        timer = null;
-      }
-      tick();
-    },
-  };
+    return [progress.join(' | '), scan.join(' | ')];
+  });
 }
 
 /**
@@ -913,7 +610,7 @@ async function main() {
   } finally {
     status.stop();
     process.off('SIGINT', onInterrupt);
-    await issueLogChain;
+    await flushIssues();
     await releaseLock();
   }
 
