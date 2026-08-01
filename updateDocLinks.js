@@ -33,6 +33,7 @@ import { google } from 'googleapis';
 import { buildIdMap } from './buildIdMap.js';
 import {
   apiStats,
+  appendErrorDetail,
   appendIssue,
   createStatusPrinter,
   createWalkContext,
@@ -909,6 +910,18 @@ async function main() {
       const message = String(err?.message ?? err);
       console.error(`${progress} ❌ ${docFile.path}: ${message}`);
       appendIssue('doc-error', `${docFile.path}\t${message}`);
+      appendErrorDetail(
+        'doc-error',
+        docFile.path,
+        message,
+        {
+          operation: 'docs.batchUpdate',
+          targetFile: { id: docFile.id, name: docFile.name },
+          targetFolder: { path: docFile.path.split('/').slice(0, -1).join('/') || '/' },
+          failedFileId: docFile.id,
+        },
+        err,
+      );
       return { docFile, error: message };
     }
   });

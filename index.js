@@ -29,10 +29,12 @@ import { stdin as input, stdout as output } from 'node:process';
 import { google } from 'googleapis';
 import {
   apiStats,
+  appendErrorDetail,
   appendIssue,
   COPY_CONCURRENCY,
   createStatusPrinter,
   driveCall,
+  ERROR_DETAIL_LOG,
   FILE_QUEUE_MAX,
   flushIssues,
   FOLDER_MIME,
@@ -49,6 +51,7 @@ import {
   recordFailure,
   SHORTCUT_MIME,
   sleep,
+  tagFailure,
   truncateName,
   VERBOSE,
   WALK_CONCURRENCY,
@@ -239,6 +242,16 @@ async function deleteTargetFileIfExists(drive, fileId, label, sourceIds) {
   );
 }
 
+/**
+ * Slash path of a child, with '/' as each tree's root. Carried on every job so
+ * a failure can be reported as a location, not just a bare file name — two
+ * folders can hold files with the same name, which is precisely the case the
+ * detail log exists to disambiguate.
+ */
+function childPath(parentPath, name) {
+  return parentPath === '/' ? `/${name}` : `${parentPath}/${name}`;
+}
+
 function progressDoneCount(stats) {
   return stats.filesCopied + stats.filesSkipped;
 }
@@ -302,10 +315,18 @@ async function walkFolder(drive, job, ctx) {
   runtime.currentFolder = job.name;
   sourceIds.add(job.sourceId);
 
+  // Tagged per side: both are files.list, and the walker that logs the failure
+  // cannot otherwise tell which of the two trees it could not read.
   const [children, targetChildren] = await Promise.all([
-    listChildren(drive, job.sourceId),
+    listChildren(drive, job.sourceId).catch((err) => {
+      throw tagFailure(err, 'files.list', { side: 'source', failedFileId: job.sourceId });
+    }),
     // A folder this run just created is known-empty; listing it is a wasted call.
-    job.targetKnownEmpty ? Promise.resolve([]) : listChildren(drive, job.targetId),
+    job.targetKnownEmpty
+      ? Promise.resolve([])
+      : listChildren(drive, job.targetId).catch((err) => {
+          throw tagFailure(err, 'files.list', { side: 'target', failedFileId: job.targetId });
+        }),
   ]);
 
   const targetByName = new Map();
@@ -341,10 +362,19 @@ async function walkFolder(drive, job, ctx) {
         stats.foldersReused += 1;
         if (existingFolders.length > 1) {
           stats.foldersAmbiguous += 1;
-          appendIssue(
-            'ambiguous-folder',
-            `${existingFolders.length} target folders named "${name}"; continuing in the first`,
-          );
+          const message = `${existingFolders.length} target folders named "${name}"; continuing in the first`;
+          appendIssue('ambiguous-folder', message);
+          // Not a failure, but the duplicate-name case the detail log is for:
+          // without the ids there is no way to tell the copies apart later.
+          appendErrorDetail('ambiguous-folder', `folder ${name}`, message, {
+            operation: 'files.list',
+            copyMode,
+            sourceFile: { id, name, mimeType },
+            targetFile: { id: targetId, name },
+            sourceFolder: { id: job.sourceId, path: job.sourcePath },
+            targetFolder: { id: job.targetId, path: job.targetPath },
+            targetFileIds: existingFolders.map((f) => f.id),
+          });
         }
         if (VERBOSE) console.log(`Using existing folder: ${name}`);
       } else {
@@ -358,7 +388,13 @@ async function walkFolder(drive, job, ctx) {
             fields: 'id',
             supportsAllDrives: true,
           }),
-        );
+        ).catch((err) => {
+          // The id sent to files.create is the parent the folder goes into.
+          throw tagFailure(err, 'files.create', {
+            failedFileId: job.targetId,
+            sourceFile: { id, name, mimeType },
+          });
+        });
         targetId = created.data.id;
         if (!targetId) throw new Error(`Folder create returned no id for ${name}`);
         stats.foldersCreated += 1;
@@ -366,7 +402,14 @@ async function walkFolder(drive, job, ctx) {
         if (VERBOSE) console.log(`Created folder: ${name}`);
       }
 
-      queues.folders.push({ sourceId: id, targetId, name, targetKnownEmpty });
+      queues.folders.push({
+        sourceId: id,
+        targetId,
+        name,
+        targetKnownEmpty,
+        sourcePath: childPath(job.sourcePath, name),
+        targetPath: childPath(job.targetPath, name),
+      });
       continue;
     }
 
@@ -396,8 +439,13 @@ async function walkFolder(drive, job, ctx) {
     queues.files.push({
       sourceId: id,
       name,
+      mimeType,
+      sourceFolderId: job.sourceId,
+      sourcePath: job.sourcePath,
       targetParentId: job.targetId,
+      targetPath: job.targetPath,
       existing: copyMode === 'recopy' ? existingSameName : [],
+      enqueuedAt: Date.now(),
     });
   }
 
@@ -414,7 +462,14 @@ async function copyFile(drive, job, ctx) {
     for (const existing of job.existing) {
       if (!existing.id) continue;
       if (VERBOSE) console.log(`Replacing file: ${job.name}`);
-      await deleteTargetFileIfExists(drive, existing.id, job.name, sourceIds);
+      // Tagged so a failed delete is logged as the delete it was, against the
+      // target id — not as a copy failure against the source id.
+      await deleteTargetFileIfExists(drive, existing.id, job.name, sourceIds).catch((err) => {
+        throw tagFailure(err, 'files.delete', {
+          failedFileId: existing.id,
+          targetFile: { id: existing.id, name: existing.name ?? job.name },
+        });
+      });
       stats.filesReplaced += 1;
     }
   }
@@ -467,7 +522,12 @@ async function runPools(drive, ctx) {
       } catch (err) {
         // A failed subtree must not sink the whole run; it is logged and the
         // final exit code is non-zero so a re-run can pick it up.
-        recordFailure(ctx, `folder ${job.name}`, err);
+        recordFailure(ctx, `folder ${job.name}`, err, {
+          operation: 'files.list',
+          copyMode: ctx.copyMode,
+          sourceFolder: { id: job.sourceId, path: job.sourcePath },
+          targetFolder: { id: job.targetId, path: job.targetPath },
+        });
       } finally {
         activeWalkers -= 1;
       }
@@ -486,7 +546,21 @@ async function runPools(drive, ctx) {
       try {
         await copyFile(drive, job, ctx);
       } catch (err) {
-        recordFailure(ctx, `file ${job.name}`, err);
+        recordFailure(ctx, `file ${job.name}`, err, {
+          operation: 'files.copy',
+          copyMode: ctx.copyMode,
+          enqueuedAt: job.enqueuedAt,
+          sourceFile: { id: job.sourceId, name: job.name, mimeType: job.mimeType },
+          // Same-named file(s) already in the target: empty in skip mode, since
+          // a file with one would never have been queued.
+          targetFile: job.existing[0]
+            ? { id: job.existing[0].id, name: job.existing[0].name ?? job.name }
+            : undefined,
+          sourceFolder: { id: job.sourceFolderId, path: job.sourcePath },
+          targetFolder: { id: job.targetParentId, path: job.targetPath },
+          failedFileId: job.sourceId,
+          targetFileIds: job.existing.map((e) => e.id),
+        });
         stats.filesFailed += 1;
       }
     }
@@ -558,6 +632,8 @@ async function main() {
     targetId: TARGET_FOLDER_ID,
     name: '/',
     targetKnownEmpty: false,
+    sourcePath: '/',
+    targetPath: '/',
   });
 
   const ctx = {
@@ -638,7 +714,7 @@ async function main() {
   );
 
   if (stats.errors) {
-    console.log(`  Errors:          ${stats.errors} (see ${ISSUE_LOG})`);
+    console.log(`  Errors:          ${stats.errors} (see ${ISSUE_LOG}; full context in ${ERROR_DETAIL_LOG})`);
     for (const line of ctx.failures.slice(0, 10)) console.log(`    - ${line}`);
     if (ctx.failures.length > 10) console.log(`    …and more in ${ISSUE_LOG}`);
     console.log('  Re-run with --continue-if-incomplete to retry the missing items.');

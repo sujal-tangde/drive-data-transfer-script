@@ -3,4 +3,5 @@ credentials.json
 token.json
 .env
 *.log
+logs/
 .migrate.lock

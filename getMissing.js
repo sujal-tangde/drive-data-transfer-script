@@ -39,6 +39,7 @@ import {
   READ_RATE,
   READ_RATE_MAX,
   recordFailure,
+  tagFailure,
   truncateName,
   WALK_CONCURRENCY,
   walkTrees,
@@ -79,7 +80,15 @@ async function createFolder(drive, name, parentId, fullPath, ctx) {
       fields: 'id',
       supportsAllDrives: true,
     }),
-  );
+  ).catch((err) => {
+    // Logged by the copier that wanted this folder, which only knows the file
+    // it was copying — the id sent to files.create is the parent it goes into.
+    throw tagFailure(err, 'files.create', {
+      failedFileId: parentId,
+      targetFile: { name },
+      targetFolder: { id: parentId, path: fullPath.split('/').slice(0, -1).join('/') || '/' },
+    });
+  });
 
   const id = res.data.id;
   if (!id) throw new Error(`Folder create returned no id for ${fullPath}`);
@@ -163,7 +172,21 @@ async function runCopiers(drive, ctx) {
       } catch (err) {
         // One bad file (or one folder we cannot create) must not end the run;
         // it is logged and the exit code reports that a re-run is needed.
-        recordFailure(ctx, `file ${fullPath}`, err);
+        const parts = fullPath.split('/');
+        const name = parts.pop();
+        const parentKey = parts.join('/');
+        const source = ctx.sourceFiles.get(fullPath);
+        recordFailure(ctx, `file ${fullPath}`, err, {
+          operation: 'files.copy',
+          sourceFile: { id: source?.id, name: source?.name ?? name, mimeType: source?.mimeType },
+          sourceFolder: { path: parentKey || '/' },
+          // Absent when the failure was creating that folder in the first place.
+          targetFolder: {
+            id: parentKey ? ctx.folderCache.get(parentKey) : ctx.targetRootId,
+            path: parentKey || '/',
+          },
+          failedFileId: source?.id,
+        });
         ctx.stats.filesFailed += 1;
       }
     }

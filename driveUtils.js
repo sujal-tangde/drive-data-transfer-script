@@ -109,6 +109,19 @@ export const SHORTCUT_MIME = 'application/vnd.google-apps.shortcut';
 
 export const ISSUE_LOG = path.join(process.cwd(), 'logs', 'issues.log');
 
+/**
+ * Structured sidecar to ISSUE_LOG: one JSON object per line (NDJSON) carrying
+ * the ids, paths and Google error fields that the one-line human log has no
+ * room for. issues.log stays exactly as it was; this is additive.
+ */
+export const ERROR_DETAIL_LOG = path.join(process.cwd(), 'logs', 'errors-detail.jsonl');
+
+/** Tags every record of this process, since runs append to the same file. */
+export const RUN_ID = `run-${new Date().toISOString()}-${process.pid}`;
+
+/** Entry script a record came from ('index.js', 'getMissing.js', …). */
+export const SCRIPT_NAME = process.argv[1] ? path.basename(process.argv[1]) : '';
+
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export function truncateName(name, max = 45) {
@@ -365,14 +378,20 @@ export async function runPool(items, concurrency, handler) {
 /** Serialized appends so concurrent workers cannot interleave a log line. */
 let logDirReady = null;
 let issueLogChain = Promise.resolve();
-export function appendIssue(kind, detail) {
+
+// Both logs live in the same directory, so one mkdir covers them, and one chain
+// means flushIssues() drains both.
+function appendLogLine(file, line) {
   logDirReady ??= fs.mkdir(path.dirname(ISSUE_LOG), { recursive: true }).catch(() => {});
-  const line = `${new Date().toISOString()}\t${kind}\t${detail}\n`;
   issueLogChain = issueLogChain
     .then(() => logDirReady)
-    .then(() => fs.appendFile(ISSUE_LOG, line, 'utf8'))
+    .then(() => fs.appendFile(file, line, 'utf8'))
     .catch(() => {});
   return issueLogChain;
+}
+
+export function appendIssue(kind, detail) {
+  return appendLogLine(ISSUE_LOG, `${new Date().toISOString()}\t${kind}\t${detail}\n`);
 }
 
 /** Awaits every append queued so far — call before the process exits. */
@@ -380,18 +399,120 @@ export function flushIssues() {
   return issueLogChain;
 }
 
+/** Google's error triple, when the failure came back from the API at all. */
+function describeApiError(err) {
+  const apiError = err?.response?.data?.error;
+  const reason = Array.isArray(apiError?.errors) ? apiError.errors[0]?.reason : undefined;
+  // Transport failures carry a string code (ECONNRESET); Gaxios sometimes puts
+  // the HTTP status there instead, which is worth keeping as the status.
+  const numericCode =
+    err?.code != null && err.code !== '' && Number.isFinite(Number(err.code))
+      ? Number(err.code)
+      : null;
+
+  return {
+    httpStatus: err?.response?.status ?? numericCode,
+    errorCode: apiError?.code ?? err?.code ?? null,
+    errorReason: reason ?? apiError?.status ?? null,
+  };
+}
+
+/**
+ * Drops empty values so a record only carries context we actually had, rather
+ * than a skeleton of nulls that reads as "we looked and it was absent".
+ */
+function prune(value) {
+  if (Array.isArray(value)) {
+    const items = value.map(prune).filter((v) => v !== undefined);
+    return items.length ? items : undefined;
+  }
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [key, v] of Object.entries(value)) {
+      const kept = prune(v);
+      if (kept !== undefined) out[key] = kept;
+    }
+    return Object.keys(out).length ? out : undefined;
+  }
+  return value === null || value === '' ? undefined : value;
+}
+
+/**
+ * Attaches the failing call's identity to the error itself.
+ *
+ * The code that logs a failure is usually a worker loop that only knows the job
+ * it started — not which of the several API calls inside it blew up. Tagging at
+ * the call site carries that across without changing where errors are handled.
+ * The innermost tag wins: the call closest to the failure knows the most.
+ *
+ * @param {unknown} err
+ * @param {string} operation e.g. 'files.copy', 'files.delete', 'files.list'
+ * @param {object} [info] merged over the logger's own info block
+ */
+export function tagFailure(err, operation, info) {
+  if (err && typeof err === 'object') {
+    err.driveOperation ??= operation;
+    if (info) err.driveInfo ??= info;
+  }
+  return err;
+}
+
+/**
+ * Appends one structured record to ERROR_DETAIL_LOG.
+ *
+ * `details` is flat at the call site: `operation`, `copyMode` and `enqueuedAt`
+ * become top-level fields, everything else (sourceFile, targetFile,
+ * sourceFolder, targetFolder, failedFileId, targetFileIds, side, …) lands under
+ * `info`. Anything the error was tagged with via tagFailure wins over it.
+ */
+export function appendErrorDetail(kind, label, message, details = {}, err = null) {
+  const { operation, copyMode, enqueuedAt, ...info } = details;
+  const failedAt = Date.now();
+  const queued = Number.isFinite(enqueuedAt) ? enqueuedAt : null;
+
+  const record = {
+    ts: new Date(failedAt).toISOString(),
+    runId: RUN_ID,
+    script: SCRIPT_NAME || undefined,
+    kind,
+    label,
+    message,
+    ...describeApiError(err),
+    operation: err?.driveOperation ?? operation,
+    copyMode,
+    enqueuedAt: queued == null ? undefined : new Date(queued).toISOString(),
+    failedAt: new Date(failedAt).toISOString(),
+    queueWaitMs: queued == null ? undefined : failedAt - queued,
+    info: prune({ ...info, ...(err?.driveInfo ?? {}) }) ?? {},
+  };
+
+  let line;
+  try {
+    line = `${JSON.stringify(record)}\n`;
+  } catch {
+    // A context object that cannot be serialized must not take the run down.
+    line = `${JSON.stringify({ ts: record.ts, runId: RUN_ID, kind, label, message, info: {} })}\n`;
+  }
+  return appendLogLine(ERROR_DETAIL_LOG, line);
+}
+
 /**
  * Records a per-item failure without aborting the run: it counts toward
- * `ctx.stats.errors`, keeps the first 50 messages for the closing summary, and
- * always lands in logs/issues.log.
+ * `ctx.stats.errors`, keeps the first 50 messages for the closing summary,
+ * always lands in logs/issues.log, and — with whatever context the caller has
+ * in hand — in logs/errors-detail.jsonl.
+ *
+ * @param {object} [details] see appendErrorDetail; omitted by callers that have
+ *   nothing beyond the label to add.
  */
-export function recordFailure(ctx, label, err) {
+export function recordFailure(ctx, label, err, details = {}) {
   const message = String(
     err?.response?.data?.error?.message ?? err?.message ?? err,
   ).replace(/\s+/g, ' ');
   ctx.stats.errors += 1;
   if (ctx.failures.length < 50) ctx.failures.push(`${label}: ${message}`);
   appendIssue('error', `${label}\t${message}`);
+  appendErrorDetail('error', label, message, details, err);
 }
 
 /** Lists every non-trashed child of a folder, following pagination. */
@@ -511,7 +632,18 @@ export async function walkTrees(drive, roots, ctx) {
       } catch (err) {
         // A subtree we cannot list must not sink the run; it is logged and the
         // caller reports a non-zero exit so the results are known incomplete.
-        recordFailure(ctx, `list ${job.side}:${job.path || '/'}`, err);
+        const folder = { id: job.id, path: job.path || '/' };
+        recordFailure(ctx, `list ${job.side}:${job.path || '/'}`, err, {
+          operation: 'files.list',
+          side: job.side,
+          failedFileId: job.id,
+          // Callers that walk a single tree name the side themselves (updateDocLinks
+          // uses 'tree'); claiming that is a source or target folder would be a lie,
+          // so it goes under the neutral key instead.
+          sourceFolder: job.side === 'source' ? folder : undefined,
+          targetFolder: job.side === 'target' ? folder : undefined,
+          folder: job.side === 'source' || job.side === 'target' ? undefined : folder,
+        });
       } finally {
         active -= 1;
       }

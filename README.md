@@ -6,15 +6,19 @@ After migration, companion scripts can **verify** the copy, **rebuild an old→n
 
 ## Scripts
 
-| Script | Purpose |
-|--------|---------|
-| `index.js` | Main recursive copy (resume-safe) |
-| `verify.js` | Compare source vs target by path; list missing / extra files |
-| `getMissing.js` | Copy only files missing from the target (by path) |
-| `driveUtils.js` | Shared plumbing: rate governor, retries, queue, walker, status block |
-| `buildIdMap.js` | Build `id-map.json` (`sourceId` → `targetId`) by matching paths |
-| `updateDocLinks.js` | Rewrite old Drive links in all Docs under the target folder |
-| `updateSingleDoc.js` | Same link rewrite for one Doc URL |
+
+| Script               | Purpose                                                              |
+| -------------------- | -------------------------------------------------------------------- |
+| `index.js`           | Main recursive copy (resume-safe)                                    |
+| `verify.js`          | Compare source vs target by path; list missing / extra files         |
+| `getMissing.js`      | Copy only files missing from the target (by path)                    |
+| `driveUtils.js`      | Shared plumbing: rate governor, retries, queue, walker, status block |
+| `buildIdMap.js`      | Build `id-map.json` (`sourceId` → `targetId`) by matching paths      |
+| `updateDocLinks.js`  | Rewrite old Drive links in all Docs under the target folder          |
+| `updateSingleDoc.js` | Same link rewrite for one Doc URL                                    |
+
+
+
 
 ## Prerequisites
 
@@ -22,22 +26,26 @@ After migration, companion scripts can **verify** the copy, **rebuild an old→n
 - A Google Cloud project with OAuth credentials
 - Source folder shared with the **target** account (Viewer is usually enough to copy)
 
+
+
 ## 1. Google Cloud setup
 
 1. Open [Google Cloud Console](https://console.cloud.google.com/) and create or select a project.
 2. **APIs & Services → Library** — enable:
-   - **Google Drive API** (required for copy)
-   - **Google Docs API** (required for link rewriting)
+  - **Google Drive API** (required for copy)
+  - **Google Docs API** (required for link rewriting)
 3. **APIs & Services → OAuth consent screen**
-   - Choose **External** (or **Internal** for org-only Workspace apps).
-   - Fill app name, support email, developer contact.
-   - Add scopes:
-     - `https://www.googleapis.com/auth/drive`
-     - `https://www.googleapis.com/auth/documents`
-   - If the app stays in **Testing**, add the target account under **Test users**.
+  - Choose **External** (or **Internal** for org-only Workspace apps).
+  - Fill app name, support email, developer contact.
+  - Add scopes:
+    - `https://www.googleapis.com/auth/drive`
+    - `https://www.googleapis.com/auth/documents`
+  - If the app stays in **Testing**, add the target account under **Test users**.
 4. **APIs & Services → Credentials → Create credentials → OAuth client ID**
-   - Application type: **Desktop app**
-   - Download the JSON and save it as **`credentials.json`** in this project folder.
+  - Application type: **Desktop app**
+  - Download the JSON and save it as `credentials.json` in this project folder.
+
+
 
 ## 2. Share the source folder
 
@@ -80,11 +88,13 @@ The first run prints a URL — open it, sign in as the **target** account, appro
 
 ### Migration CLI flags
 
-| Flag | Meaning |
-|------|---------|
-| *(default)* / `--continue-if-incomplete` | Skip files that already exist in the target by name; copy only missing |
-| `--continue-with-re-copy` | Delete same-named **target** files, then re-copy from source (source is never deleted) |
-| `--verbose` / `-v` | Add a per-file log line on top of the status block |
+
+| Flag                                     | Meaning                                                                                |
+| ---------------------------------------- | -------------------------------------------------------------------------------------- |
+| *(default)* / `--continue-if-incomplete` | Skip files that already exist in the target by name; copy only missing                 |
+| `--continue-with-re-copy`                | Delete same-named **target** files, then re-copy from source (source is never deleted) |
+| `--verbose` / `-v`                       | Add a per-file log line on top of the status block                                     |
+
 
 Do not pass both `--continue-if-incomplete` and `--continue-with-re-copy`.
 
@@ -92,25 +102,27 @@ Do not pass both `--continue-if-incomplete` and `--continue-with-re-copy`.
 
 ### Environment variables
 
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `SOURCE_FOLDER_ID` | — | Source folder ID (required) |
-| `TARGET_FOLDER_ID` | — | Destination folder ID (required) |
-| `GOOGLE_OAUTH_CREDENTIALS` | `./credentials.json` | Path to OAuth client JSON |
-| `GOOGLE_OAUTH_TOKEN` | `./token.json` | Where to store tokens |
-| `WALK_CONCURRENCY` | `6` | Folder-walker workers (listing) |
-| `COPY_CONCURRENCY` | `8` | File-copy workers |
-| `READ_RATE` / `READ_RATE_MAX` | `15` / `40` | Read requests per second: starting rate and ceiling |
-| `WRITE_RATE` / `WRITE_RATE_MAX` | `6` / `20` | Write requests per second: starting rate and ceiling |
-| `FILE_QUEUE_MAX` | `20000` | Backpressure cap on queued-but-uncopied files |
-| `DRIVE_MAX_RETRIES` | `10` | Retries for 429 / rate-limit 403 / 5xx / network errors |
-| `LOG_INTERVAL_MS` | `1000` | How often the two-line status block is printed (min `200`) |
-| `MAX_WALK_DEPTH` | `100` | Depth cap for the path walk in `verify.js` / `getMissing.js` / `buildIdMap.js` / `updateDocLinks.js` |
-| `DOC_CONCURRENCY` | `4` | Google Docs processed at once by `updateDocLinks.js` (max `8`) |
-| `DOCS_RATE` / `DOCS_RATE_MAX` | `3` / `8` | Docs API requests per second: starting rate and ceiling |
-| `VERBOSE` | — | Set to `1` for verbose logs |
-| `ID_MAP_PATH` | `./id-map.json` | Path used by link-rewrite scripts |
-| `FORCE_REBUILD_DETAILED_MAP` | — | Set to `1` to rebuild `id-map-detailed.json` |
+
+| Variable                        | Default              | Meaning                                                                                              |
+| ------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------- |
+| `SOURCE_FOLDER_ID`              | —                    | Source folder ID (required)                                                                          |
+| `TARGET_FOLDER_ID`              | —                    | Destination folder ID (required)                                                                     |
+| `GOOGLE_OAUTH_CREDENTIALS`      | `./credentials.json` | Path to OAuth client JSON                                                                            |
+| `GOOGLE_OAUTH_TOKEN`            | `./token.json`       | Where to store tokens                                                                                |
+| `WALK_CONCURRENCY`              | `6`                  | Folder-walker workers (listing)                                                                      |
+| `COPY_CONCURRENCY`              | `8`                  | File-copy workers                                                                                    |
+| `READ_RATE` / `READ_RATE_MAX`   | `15` / `40`          | Read requests per second: starting rate and ceiling                                                  |
+| `WRITE_RATE` / `WRITE_RATE_MAX` | `6` / `20`           | Write requests per second: starting rate and ceiling                                                 |
+| `FILE_QUEUE_MAX`                | `20000`              | Backpressure cap on queued-but-uncopied files                                                        |
+| `DRIVE_MAX_RETRIES`             | `10`                 | Retries for 429 / rate-limit 403 / 5xx / network errors                                              |
+| `LOG_INTERVAL_MS`               | `1000`               | How often the two-line status block is printed (min `200`)                                           |
+| `MAX_WALK_DEPTH`                | `100`                | Depth cap for the path walk in `verify.js` / `getMissing.js` / `buildIdMap.js` / `updateDocLinks.js` |
+| `DOC_CONCURRENCY`               | `4`                  | Google Docs processed at once by `updateDocLinks.js` (max `8`)                                       |
+| `DOCS_RATE` / `DOCS_RATE_MAX`   | `3` / `8`            | Docs API requests per second: starting rate and ceiling                                              |
+| `VERBOSE`                       | —                    | Set to `1` for verbose logs                                                                          |
+| `ID_MAP_PATH`                   | `./id-map.json`      | Path used by link-rewrite scripts                                                                    |
+| `FORCE_REBUILD_DETAILED_MAP`    | —                    | Set to `1` to rebuild `id-map-detailed.json`                                                         |
+
 
 The concurrency, rate, retry and logging variables apply to **every script** — `index.js`, `verify.js`, `getMissing.js`, `buildIdMap.js` and `updateDocLinks.js` all share `driveUtils.js`, so tuning `READ_RATE` once changes all of them. Exceptions:
 
@@ -120,9 +132,11 @@ The concurrency, rate, retry and logging variables apply to **every script** —
 
 The **Docs API has its own governor**, separate from the Drive read/write buckets. Docs quota is much tighter than Drive's, and the two must not throttle each other: a Docs 429 slows only doc rewriting, and a Drive 429 slows only listing. Defaults are deliberately conservative.
 
-`DRIVE_REQUEST_DELAY_MS` and `SCAN_REQUEST_DELAY_MS` are retired **everywhere, including `buildIdMap.js` and `updateDocLinks.js`** — no script sleeps a fixed amount after a successful call any more. Pacing is the adaptive governor's job. Setting them has no effect.
+`DRIVE_REQUEST_DELAY_MS` and `SCAN_REQUEST_DELAY_MS` are retired **everywhere, including** `buildIdMap.js` **and** `updateDocLinks.js` — no script sleeps a fixed amount after a successful call any more. Pacing is the adaptive governor's job. Setting them has no effect.
 
 ## Typical workflow
+
+
 
 ### 1. Migrate
 
@@ -132,6 +146,8 @@ npm start
 node index.js --continue-if-incomplete
 ```
 
+
+
 ### 2. Verify (optional)
 
 ```bash
@@ -140,7 +156,7 @@ node verify.js
 
 Lists files present in source but missing in target (and extras in target), matched by full path.
 
-**Read-only** — it never copies, creates or deletes, and only ever charges the read quota. Both trees are walked **concurrently in one pool of `WALK_CONCURRENCY` workers**, so the source and target listings overlap instead of running one after the other. Progress is a two-line status block (`[progress]` per-tree counts + `[scan]` queue and API health).
+**Read-only** — it never copies, creates or deletes, and only ever charges the read quota. Both trees are walked **concurrently in one pool of** `WALK_CONCURRENCY` **workers**, so the source and target listings overlap instead of running one after the other. Progress is a two-line status block (`[progress]` per-tree counts + `[scan]` queue and API health).
 
 Missing/extra lists are **sorted** rather than printed in traversal order: a concurrent walk has no stable order between runs, and sorting groups each folder's files together.
 
@@ -189,7 +205,7 @@ Smart chips (rich links) are replaced by deleting the chip and inserting a norma
 
 #### `buildIdMap.js`
 
-**Read-only** (`files.list` only). Source and target are walked **concurrently in one pool of `WALK_CONCURRENCY` workers** and paced by the adaptive read governor, with a two-line status block while mapping. Matching is by full slash-path, exactly as before; `id-map.json` is still `{ sourceId: targetId }` covering both files and folders, and unmatched source files/folders are still reported.
+**Read-only** (`files.list` only). Source and target are walked **concurrently in one pool of** `WALK_CONCURRENCY` **workers** and paced by the adaptive read governor, with a two-line status block while mapping. Matching is by full slash-path, exactly as before; `id-map.json` is still `{ sourceId: targetId }` covering both files and folders, and unmatched source files/folders are still reported.
 
 The module API is unchanged — `authorize()`, `buildIdMap(drive, { sourceFolderId, targetFolderId, outputPath, write })` and `mapAll()` all keep their signatures, so `updateDocLinks.js`'s auto-build path still works. If any folder fails to list, the run says so and the map is flagged INCOMPLETE (paths under an unlistable folder would otherwise be reported as unmatched).
 
@@ -221,9 +237,59 @@ Old-ID metadata lookups are shared across concurrent docs: the first document to
 - **Path matching vs. name matching**: `index.js` walks and dedupes by folder **id** (it copies each folder once). `verify.js` and `getMissing.js` compare by **full path**, so a folder reachable by two paths is two entries and is walked once per distinct path; their visit key is `(id, path)`. `MAX_WALK_DEPTH` bounds that walk in case a pathological multi-parent graph nests without end.
 - **Shortcuts** are counted as ordinary files by `verify.js` / `getMissing.js`, because a shortcut occupies a path. Since `index.js` does not copy shortcuts, source shortcuts legitimately show up as missing in `verify.js`; the count is reported separately at the end.
 - **Only one run at a time**: `.migrate.lock` prevents two concurrent migrations, which would each duplicate what the other creates. Delete it manually if a process died hard.
-- **Failures do not abort the run.** Per-file and per-folder errors are logged to `logs/issues.log` (along with skipped shortcuts and ambiguous folder names), and the process exits non-zero so you know to re-run with `--continue-if-incomplete`.
+- **Failures do not abort the run.** Per-file and per-folder errors are logged to `logs/issues.log` (along with skipped shortcuts and ambiguous folder names) and, with full context, to `logs/errors-detail.jsonl` (see [Logs](#logs)); the process exits non-zero so you know to re-run with `--continue-if-incomplete`.
 - **Ctrl+C** stops cleanly after in-flight requests finish; press it twice to force quit.
 - **Shared drives**: listing/copy use `supportsAllDrives` / `includeItemsFromAllDrives`.
+
+## Logs
+
+Every script writes two failure logs into `logs/`, both appended to across runs.
+
+**`logs/issues.log` — unchanged.** One tab-separated line per event, `<timestamp>\t<kind>\t<detail>`, where `kind` is `error`, `shortcut-skipped`, `ambiguous-folder`, `depth-limit` or `doc-error`. Read it to see *what* went wrong.
+
+**`logs/errors-detail.jsonl` — new, additive.** One JSON object per line (NDJSON) for the same events, carrying the ids and paths that do not fit on a log line. Read it when a message alone is not enough — which of two same-named files 404'd, which folder a failed copy was going into, whether a 404 was on the source id or the target id. Nothing is removed from `issues.log` to make room for it; the two are written from the same call.
+
+```jsonc
+{
+  "ts": "2026-08-01T14:19:20.244Z",   // when it failed
+  "runId": "run-2026-08-01T14:19:20.208Z-16316",  // run-<ISO>-<pid>, to separate runs in one file
+  "script": "index.js",               // entry script
+  "kind": "error",                    // same kinds as issues.log
+  "label": "file Invoice.pdf",        // same label as issues.log
+  "message": "Insufficient permissions to delete tgtInvoice.",
+  "httpStatus": 403,                  // Google's error fields, null when the
+  "errorCode": 403,                   //   failure did not come back from the API
+  "errorReason": "insufficientFilePermissions",
+  "operation": "files.delete",        // the call that actually failed
+  "copyMode": "recopy",               // skip | recopy, where it applies
+  "enqueuedAt": "...", "failedAt": "...", "queueWaitMs": 28,
+  "info": {
+    "sourceFile":   { "id": "...", "name": "Invoice.pdf", "mimeType": "application/pdf" },
+    "targetFile":   { "id": "...", "name": "Invoice.pdf" },  // same-named target, if any
+    "sourceFolder": { "id": "...", "path": "/Accounts/2026" },
+    "targetFolder": { "id": "...", "path": "/Accounts/2026" },
+    "failedFileId": "...",            // the id actually sent to the failing call
+    "targetFileIds": ["...", "..."],  // all same-named target files (recopy mode)
+    "side": "target"                  // which tree a files.list failure was on
+  }
+}
+```
+
+Keys are omitted rather than written empty, so a record only shows context that was actually known — a copy that failed before its target folder existed has no `targetFolder.id`. `operation` is reported by the call that failed, so a failed delete in `--continue-with-re-copy` is logged as `files.delete` against the **target** id, not as a copy failure against the source id.
+
+Both files are written through one serialized append chain, so concurrent workers never interleave a line, and both are flushed before the process exits.
+
+Every line is a standalone JSON object, so any NDJSON tool reads it — e.g. every 404 with the id and folder that produced it (PowerShell):
+
+```powershell
+Get-Content logs\errors-detail.jsonl | ConvertFrom-Json |
+  Where-Object { $_.httpStatus -eq 404 } |
+  Select-Object operation, label, @{n='id';e={$_.info.failedFileId}}, @{n='path';e={$_.info.sourceFolder.path}}
+```
+
+`updateDocLinks.js` additionally writes per-run report files to `logs/run-<timestamp>-<pid>/`.
+
+
 
 ## Security
 
