@@ -19,12 +19,21 @@
  *                                        (replaced and/or failed — full detail)
  *     summary.json                       aggregate counters
  *
- * Smart chip handling:
- *   The Docs API does not expose a direct way to mutate a richLink's URI.
- *   Instead we delete the chip and re-insert it as a regular hyperlinked text
- *   run (using the chip's title as display text, falling back to the new URL).
- *   These index-shifting operations are collected separately and applied in
- *   reverse-index order so earlier replacements don't corrupt later indices.
+ * Editing model (see processDoc):
+ *   Docs edits are index-based, and any edit that changes the document length
+ *   invalidates every index after it. Edits are therefore split into two kinds:
+ *
+ *     non-shifting  updateTextStyle to retarget an existing hyperlink. The text
+ *                   is untouched, so all indices from the walk stay valid.
+ *     shifting      smart chips (which have no mutable URI, so they are deleted
+ *                   and re-inserted as hyperlinked text) and runs whose visible
+ *                   text contains an old URL.
+ *
+ *   Non-shifting edits go first, in one batch, against the walked indices.
+ *   Shifting edits then go in a single batch sorted highest-index-first, so
+ *   each one only moves text that later requests do not refer to. Splitting
+ *   shifting edits across batches computed from the same snapshot — which is
+ *   what this used to do — silently shreds the document.
  */
 
 import * as fs from 'node:fs/promises';
@@ -262,21 +271,54 @@ async function buildDetailedMap(drive, idMap) {
 }
 
 // ---- Doc body walker ----
-function* walkParagraphs(structuralElements, state = { pIndex: 0 }) {
+function* walkParagraphs(structuralElements, state = { pIndex: 0 }, segmentId = '') {
   for (const block of structuralElements || []) {
     if (block.paragraph) {
-      yield { paragraph: block.paragraph, paragraphIndex: state.pIndex };
+      yield { paragraph: block.paragraph, paragraphIndex: state.pIndex, segmentId };
       state.pIndex += 1;
     } else if (block.table) {
       for (const row of block.table.tableRows || []) {
         for (const cell of row.tableCells || []) {
-          yield* walkParagraphs(cell.content || [], state);
+          yield* walkParagraphs(cell.content || [], state, segmentId);
         }
       }
     } else if (block.tableOfContents) {
-      yield* walkParagraphs(block.tableOfContents.content || [], state);
+      yield* walkParagraphs(block.tableOfContents.content || [], state, segmentId);
     }
   }
+}
+
+/**
+ * Every paragraph in the document — body first, then headers, footers and
+ * footnotes.
+ *
+ * Docs indices are per-SEGMENT, not document-wide: index 42 in a header is a
+ * different character from index 42 in the body. Every yielded paragraph
+ * therefore carries the segmentId its indices belong to, and any range built
+ * from them must carry it too. Walking only the body (as this used to) meant
+ * links in headers and footers were never seen.
+ */
+function* walkDocument(doc, state = { pIndex: 0 }) {
+  yield* walkParagraphs(doc.body?.content || [], state, '');
+  for (const group of ['headers', 'footers', 'footnotes']) {
+    for (const [segmentId, segment] of Object.entries(doc[group] || {})) {
+      yield* walkParagraphs(segment.content || [], state, segmentId);
+    }
+  }
+}
+
+/** Docs Range/Location omit segmentId for the body and require it elsewhere. */
+function docRange(segmentId, startIndex, endIndex) {
+  return segmentId ? { segmentId, startIndex, endIndex } : { startIndex, endIndex };
+}
+
+function docLocation(segmentId, index) {
+  return segmentId ? { segmentId, index } : { index };
+}
+
+/** Replace every occurrence of `find` in `text` — no regex escaping needed. */
+function replaceAllLiteral(text, find, replacement) {
+  return text.split(find).join(replacement);
 }
 
 function snippetFromText(text, maxLen = 80) {
@@ -380,28 +422,41 @@ export async function processDoc(docs, drive, fileEntry, ctx) {
   );
   const doc = docResp.data;
 
-  const textReplacements = [];
+  const dryRun = Boolean(ctx.dryRun);
 
   /**
-   * NON-SHIFTING requests: updateTextStyle on existing runs, replaceAllText.
-   * These don't change character counts so indices stay valid for each other.
-   */
-  const styleRequests = [];
-  /** replaceAllText pairs (oldUrl -> newUrl). Applied after style updates. */
-  const replacePairs = new Map();
-
-  /**
-   * SHIFTING requests: smart chip replacements (delete chip → insert text → style link).
-   * Each operation changes the document length, so they MUST be applied in
-   * descending startIndex order and sent in a separate batchUpdate AFTER the
-   * non-shifting batch completes.
+   * Every edit is sorted into exactly one of two buckets, because the only way
+   * to keep Docs indices valid is to know which edits move them.
    *
-   * Each entry: { startIndex, endIndex, displayText, newUrl, originalUrl, paragraphIndex, snippet }
+   * NON-SHIFTING — retargeting an existing hyperlink with updateTextStyle. The
+   * visible text is untouched, so the document length does not change and every
+   * index captured during the walk stays valid. Safe to send as one batch.
+   *
+   *   { segmentId, startIndex, endIndex, url }
    */
-  const smartChipReplacements = [];
+  const retargets = [];
+
+  /**
+   * SHIFTING — anything that rewrites visible text: a smart chip becoming a
+   * hyperlink, or a run whose text literally contains an old Drive URL. Each is
+   * delete → insert → restyle, which changes the document length, so they are
+   * applied highest-index-first in a single batch AFTER the non-shifting one.
+   *
+   *   { segmentId, startIndex, endIndex, text, style, fields }
+   */
+  const rewrites = [];
 
   const successReplacements = [];
   const failures = [];
+
+  /**
+   * Links that already point at the right file. They are neither a failure nor
+   * a replacement: emitting an edit for them would rewrite a URL to itself,
+   * burn a revision, and report "N links replaced" on a run that changed
+   * nothing — which is precisely the kind of false green that hides real
+   * breakage. Counted, not acted on.
+   */
+  let alreadyCorrect = 0;
 
   function skipSilentSameIdResolved(resolved, oldId) {
     return (
@@ -417,9 +472,7 @@ export async function processDoc(docs, drive, fileEntry, ctx) {
     );
   }
 
-  for (const { paragraph, paragraphIndex } of walkParagraphs(
-    doc.body?.content || [],
-  )) {
+  for (const { paragraph, paragraphIndex, segmentId } of walkDocument(doc)) {
     const elements = paragraph.elements || [];
     const paraText = elements
       .map(
@@ -463,14 +516,19 @@ export async function processDoc(docs, drive, fileEntry, ctx) {
         const displayText = newUrl;
 
         if (shouldRewriteOrLogSuccess(resolved, oldId)) {
-          smartChipReplacements.push({
+          if (newUrl === uri) {
+            alreadyCorrect += 1; // chip already points into the target
+            continue;
+          }
+          // A chip is one index unit; it becomes a hyperlinked URL string, so
+          // this always lengthens the segment — strictly a shifting edit.
+          rewrites.push({
+            segmentId,
             startIndex: el.startIndex,
             endIndex: el.endIndex,
-            displayText,
-            newUrl,
-            originalUrl: uri,
-            paragraphIndex,
-            snippet,
+            text: displayText,
+            style: { link: { url: newUrl } },
+            fields: 'link',
           });
 
           successReplacements.push({
@@ -492,11 +550,11 @@ export async function processDoc(docs, drive, fileEntry, ctx) {
       if (!el.textRun) continue;
 
       const tr = el.textRun;
-      const start = el.startIndex;
-      const end = el.endIndex;
+      const content = tr.content || '';
       const linkUrl = tr.textStyle?.link?.url;
 
-      // Hyperlinked text run
+      // ---- The run's hyperlink target (what the text points at) ----
+      let newLinkUrl = null;
       if (linkUrl && isDocsOrDriveUrl(linkUrl)) {
         const oldId = extractDriveId(linkUrl);
         const resolved = await resolveOldId(drive, oldId, ctx);
@@ -507,185 +565,192 @@ export async function processDoc(docs, drive, fileEntry, ctx) {
             paragraphIndex,
             textSnippet: snippet,
           });
-        } else if (!skipSilentSameIdResolved(resolved, oldId) &&
-          shouldRewriteOrLogSuccess(resolved, oldId)) {
-          const newUrl = replaceIdInUrl(linkUrl, oldId, resolved.newId);
-          textReplacements.push({
-            startIndex: start,
-            endIndex: end,
-            newUrl,
-          });
-          successReplacements.push({
-            originalUrl: linkUrl,
-            newUrl,
-            matchedBy: resolved.source,
-            paragraphIndex,
-            textSnippet: snippet,
-          });
-        }
-      }
-      // Else if linkUrl: other domains — ignore (not in scope for this migration)
-
-      // Plain-text URLs in the run content (URLs pasted without a hyperlink).
-      // Skip the URL we already handled via the hyperlink branch above.
-      const content = tr.content || '';
-      const matches = content.match(GOOGLE_URL_REGEX) || [];
-      for (const url of matches) {
-        if (linkUrl && url === linkUrl) continue;
-        const oldId = extractDriveId(url);
-        const resolved = await resolveOldId(drive, oldId, ctx);
-        if (!resolved) {
-          failures.push({
-            url,
-            reason: 'MISSING_IN_ID_MAP',
-            paragraphIndex,
-            textSnippet: snippet,
-          });
         } else if (
           !skipSilentSameIdResolved(resolved, oldId) &&
           shouldRewriteOrLogSuccess(resolved, oldId)
         ) {
-          const newUrl = replaceIdInUrl(url, oldId, resolved.newId);
-          if (newUrl !== url) {
-            replacePairs.set(url, newUrl);
+          const candidate = replaceIdInUrl(linkUrl, oldId, resolved.newId);
+          if (candidate === linkUrl) {
+            alreadyCorrect += 1;
+          } else {
+            newLinkUrl = candidate;
+            successReplacements.push({
+              originalUrl: linkUrl,
+              newUrl: newLinkUrl,
+              replacedAs: 'HYPERLINK_RETARGETED',
+              matchedBy: resolved.source,
+              paragraphIndex,
+              textSnippet: snippet,
+            });
+          }
+        }
+      }
+      // Else if linkUrl: other domains — ignore (not in scope for this migration)
+
+      // ---- Drive URLs sitting in the run's VISIBLE TEXT ----
+      // A URL that is also the run's link target was already resolved and
+      // logged above; reuse that result rather than resolving (and reporting)
+      // the same link twice.
+      let newContent = content;
+      for (const url of content.match(GOOGLE_URL_REGEX) || []) {
+        let newUrl;
+        if (linkUrl && url === linkUrl) {
+          newUrl = newLinkUrl;
+        } else {
+          const oldId = extractDriveId(url);
+          const resolved = await resolveOldId(drive, oldId, ctx);
+          if (!resolved) {
+            failures.push({
+              url,
+              reason: 'MISSING_IN_ID_MAP',
+              paragraphIndex,
+              textSnippet: snippet,
+            });
+            continue;
+          }
+          if (
+            skipSilentSameIdResolved(resolved, oldId) ||
+            !shouldRewriteOrLogSuccess(resolved, oldId)
+          ) {
+            continue;
+          }
+          newUrl = replaceIdInUrl(url, oldId, resolved.newId);
+          if (newUrl === url) {
+            alreadyCorrect += 1;
+            continue;
           }
           successReplacements.push({
             originalUrl: url,
             newUrl,
+            replacedAs: 'TEXT_URL_REWRITTEN',
             matchedBy: resolved.source,
             paragraphIndex,
             textSnippet: snippet,
+          });
+        }
+        if (newUrl && newUrl !== url) {
+          newContent = replaceAllLiteral(newContent, url, newUrl);
+        }
+      }
+
+      if (newContent !== content) {
+        // The text itself has to change, so this is a delete → insert → restyle.
+        // The whole run is replaced in one edit, which keeps every shifting edit
+        // on a disjoint range and makes the descending-order pass below sound.
+        let startIndex = el.startIndex;
+        let endIndex = el.endIndex;
+        let text = newContent;
+
+        // A run that ends a paragraph includes the paragraph mark. Deleting it
+        // merges this paragraph into the next one, so keep it out of the range.
+        if (content.endsWith('\n')) {
+          endIndex -= 1;
+          text = text.slice(0, -1);
+        }
+
+        if (endIndex > startIndex && text.length > 0) {
+          // insertText inherits formatting from the preceding character, so the
+          // run's own style is captured and re-applied over the inserted range —
+          // otherwise bold/size/colour would be silently lost on every rewrite.
+          const style = { ...(tr.textStyle || {}) };
+          const finalLink = newLinkUrl || linkUrl;
+          if (finalLink) style.link = { url: finalLink };
+          else delete style.link;
+          const fields = [...new Set([...Object.keys(style), 'link'])].join(',');
+
+          rewrites.push({ segmentId, startIndex, endIndex, text, style, fields });
+        }
+      } else if (newLinkUrl) {
+        // Text unchanged — only the link target moves. updateTextStyle does that
+        // without touching a single character, so it neither loses the anchor
+        // text nor shifts any index.
+        let endIndex = el.endIndex;
+        if (content.endsWith('\n')) endIndex -= 1;
+        if (endIndex > el.startIndex) {
+          retargets.push({
+            segmentId,
+            startIndex: el.startIndex,
+            endIndex,
+            url: newLinkUrl,
           });
         }
       }
     }
   }
 
-  // ---- Batch 1: non-shifting requests (style + replaceAllText) ----
-  const batch1 = [...styleRequests];
-  for (const [oldUrl, newUrl] of replacePairs) {
-    if (oldUrl === newUrl) continue;
-    batch1.push({
-      replaceAllText: {
-        containsText: { text: oldUrl, matchCase: true },
-        replaceText: newUrl,
-      },
-    });
+  const modified = retargets.length > 0 || rewrites.length > 0;
+
+  if (dryRun) {
+    return { successReplacements, failures, modified, alreadyCorrect };
   }
 
-  if (batch1.length > 0) {
-    await docsCall(`docs.batchUpdate(styles) ${fileEntry.name}`, () =>
+  // ---- Batch 1: retargets (non-shifting) ----
+  // updateTextStyle never changes the document length, so every index captured
+  // during the walk is still exactly right when this batch runs. It must go
+  // FIRST, while the document still matches what the walk saw.
+  if (retargets.length > 0) {
+    await docsCall(`docs.batchUpdate(retarget) ${fileEntry.name}`, () =>
       docs.documents.batchUpdate({
         documentId: fileEntry.id,
-        requestBody: { requests: batch1 },
+        requestBody: {
+          requests: retargets.map((r) => ({
+            updateTextStyle: {
+              range: docRange(r.segmentId, r.startIndex, r.endIndex),
+              textStyle: { link: { url: r.url } },
+              fields: 'link',
+            },
+          })),
+        },
       }),
     );
   }
 
-  // ---- Batch 2: smart chip replacements, highest index first ----
-  // Each chip is replaced by: deleteContentRange → insertText → updateTextStyle.
-  // Processing highest-index first means earlier chips' indices are unaffected.
-  if (smartChipReplacements.length > 0) {
-    smartChipReplacements.sort((a, b) => b.startIndex - a.startIndex);
-
-    for (const chip of smartChipReplacements) {
-      const { startIndex, endIndex, displayText, newUrl } = chip;
-      const insertLen = displayText.length;
-
-      const chipRequests = [
-        // 1. Remove the smart chip element (single structural element = one char in the index).
-        {
-          deleteContentRange: {
-            range: { startIndex, endIndex },
-          },
-        },
-        // 2. Insert the display text at the same position.
-        {
-          insertText: {
-            location: { index: startIndex },
-            text: displayText,
-          },
-        },
-        // 3. Apply the hyperlink style to the newly inserted text.
-        {
-          updateTextStyle: {
-            range: {
-              startIndex,
-              endIndex: startIndex + insertLen,
-            },
-            textStyle: { link: { url: newUrl } },
-            fields: 'link',
-          },
-        },
-      ];
-
-      // Strictly sequential within a doc: each chip edit shifts the indices of
-      // everything before it, so these must stay one-at-a-time in descending
-      // index order. The governor paces them; no fixed sleep needed.
-      await docsCall(
-        `docs.batchUpdate(smartChip@${startIndex}) ${fileEntry.name}`,
-        () =>
-          docs.documents.batchUpdate({
-            documentId: fileEntry.id,
-            requestBody: { requests: chipRequests },
-          }),
-      );
-    }
-  }
-
-  // ---- Batch 3: replace text with URL ----
-  if (textReplacements.length > 0) {
-    textReplacements.sort((a, b) => b.startIndex - a.startIndex);
+  // ---- Batch 2: every length-changing edit, highest index first ----
+  // Requests inside one batchUpdate are applied in array order, and an edit only
+  // moves the indices of content AFTER it. Sorting descending (within each
+  // segment, since indices are per-segment) therefore keeps every later request
+  // pointing at the character it was computed from — no re-fetch, no arithmetic.
+  //
+  // This ordering is the whole ballgame: mixing these edits with the batch above,
+  // or splitting them across batches computed from the same original snapshot,
+  // is what shreds the document.
+  if (rewrites.length > 0) {
+    rewrites.sort((a, b) =>
+      a.segmentId === b.segmentId
+        ? b.startIndex - a.startIndex
+        : a.segmentId < b.segmentId
+          ? -1
+          : 1,
+    );
 
     const requests = [];
-
-    for (const item of textReplacements) {
-      const { startIndex, endIndex, newUrl } = item;
-
+    for (const e of rewrites) {
       requests.push(
-        {
-          deleteContentRange: {
-            range: { startIndex, endIndex },
-          },
-        },
-        {
-          insertText: {
-            location: { index: startIndex },
-            text: newUrl,
-          },
-        },
+        { deleteContentRange: { range: docRange(e.segmentId, e.startIndex, e.endIndex) } },
+        { insertText: { location: docLocation(e.segmentId, e.startIndex), text: e.text } },
         {
           updateTextStyle: {
-            range: {
-              startIndex,
-              endIndex: startIndex + newUrl.length,
-            },
-            textStyle: { link: { url: newUrl } },
-            fields: 'link',
+            range: docRange(e.segmentId, e.startIndex, e.startIndex + e.text.length),
+            textStyle: e.style,
+            fields: e.fields,
           },
-        }
+        },
       );
     }
 
-    await docsCall(`docs.batchUpdate(textReplace) ${fileEntry.name}`, () =>
+    await docsCall(`docs.batchUpdate(rewrite) ${fileEntry.name}`, () =>
       docs.documents.batchUpdate({
         documentId: fileEntry.id,
         requestBody: { requests },
-      })
+      }),
     );
   }
-
-  // const modified = batch1.length > 0 || smartChipReplacements.length > 0;
-
-  const modified =
-    batch1.length > 0 ||
-    smartChipReplacements.length > 0 ||
-    textReplacements.length > 0;
 
   return {
     successReplacements,
     failures,
     modified,
+    alreadyCorrect,
   };
 }
 

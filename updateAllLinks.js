@@ -26,11 +26,17 @@
  *   .env: TARGET_FOLDER_ID (required), SOURCE_FOLDER_ID (to build the id-map)
  *   credentials.json + token.json (same OAuth as the rest of the toolkit)
  *
+ * Before writing anything, every id the map points AT is checked against the
+ * target tree. A map left over from an earlier migration still resolves but
+ * names files that no longer exist, which produces a run that reports success
+ * while pointing every link at a dead id — see the preflight in main().
+ *
  * USAGE
  *   node updateAllLinks.js --dry-run          # report only, change nothing
  *   node updateAllLinks.js                    # apply to all four types
  *   node updateAllLinks.js --only=sheets      # docs | sheets | docx | xlsx (comma-sep)
  *   node updateAllLinks.js --skip=docx,xlsx   # inverse of --only
+ *   node updateAllLinks.js --rebuild-map      # rebuild a stale id-map instead of aborting
  *
  * OUTPUT
  *   logs/linkfix-<timestamp>/{summary.json, changes.json, failures.json}
@@ -60,6 +66,7 @@ import {
   loadOrBuildIdMap,
   processDoc,
 } from './updateDocLinks.js';
+import { buildIdMap } from './buildIdMap.js';
 
 /* ------------------------------------------------------------------ config */
 
@@ -120,6 +127,9 @@ const KIND_BY_MIME = {
 };
 
 const DRY_RUN = process.argv.includes('--dry-run');
+
+/** Rebuild id-map.json in place instead of aborting when it has gone stale. */
+const REBUILD_MAP = process.argv.includes('--rebuild-map');
 
 function listArg(flag) {
   const hit = process.argv.find((a) => a.startsWith(`${flag}=`));
@@ -280,11 +290,14 @@ async function processSheet(sheetsApi, fileEntry, resolve) {
           let cellChanged = false;
 
           // --- 1 & 2: formula or plain string content ---
+          // These go inside userEnteredValue, not at the top of CellData —
+          // a bare {stringValue} is rejected as "Unknown name" and takes the
+          // whole (atomic) batch down with it.
           const uev = cell.userEnteredValue ?? {};
           if (typeof uev.formulaValue === 'string') {
             const r = rewriteUrlsInText(uev.formulaValue, resolve);
             if (r.changes.length) {
-              newValue.formulaValue = r.text;
+              newValue.userEnteredValue = { formulaValue: r.text };
               fieldsTouched.push('userEnteredValue');
               cellChanged = true;
               r.changes.forEach((c) => changes.push({ where, kind: 'formula', ...c }));
@@ -293,7 +306,7 @@ async function processSheet(sheetsApi, fileEntry, resolve) {
           } else if (typeof uev.stringValue === 'string') {
             const r = rewriteUrlsInText(uev.stringValue, resolve);
             if (r.changes.length) {
-              newValue.stringValue = r.text;
+              newValue.userEnteredValue = { stringValue: r.text };
               fieldsTouched.push('userEnteredValue');
               cellChanged = true;
               r.changes.forEach((c) => changes.push({ where, kind: 'text', ...c }));
@@ -479,11 +492,73 @@ async function main() {
   const docsApi = google.docs({ version: 'v1', auth });
   const sheetsApi = google.sheets({ version: 'v4', auth });
 
-  const idMap = await loadOrBuildIdMap(drive);
+  let idMap = await loadOrBuildIdMap(drive);
   console.log(`id-map:  ${Object.keys(idMap).length} entries`);
 
   console.log('\nScanning target tree…');
-  const { allItems } = await listTarget(drive, TARGET_FOLDER_ID);
+  let { allItems } = await listTarget(drive, TARGET_FOLDER_ID);
+
+  /**
+   * PREFLIGHT: does every id the map points AT still exist in the target tree?
+   *
+   * A map built against an earlier migration keeps resolving — its keys are the
+   * unchanged source ids — but its values name files that were replaced or
+   * deleted. The run then reports "12 links replaced" while pointing every one
+   * of them at a dead id, and nothing downstream can tell the difference. That
+   * failure is silent, permanent, and only visible by opening the files, so it
+   * is checked here before a single write goes out.
+   */
+  async function validateIdMap() {
+    const known = new Set(allItems.map((i) => i.id));
+    known.add(TARGET_FOLDER_ID); // the root is never listed as its own child
+    return Object.entries(idMap).filter(([, newId]) => !known.has(newId));
+  }
+
+  let stale = await validateIdMap();
+  if (stale.length > 0) {
+    console.log(
+      `\n[stale id-map] ${stale.length}/${Object.keys(idMap).length} entries point at ids ` +
+        'that are NOT in the target tree:',
+    );
+    for (const [oldId, newId] of stale.slice(0, 10)) {
+      console.log(`    ${oldId}  ->  ${newId}   (missing)`);
+    }
+    if (stale.length > 10) console.log(`    …and ${stale.length - 10} more`);
+
+    if (!REBUILD_MAP) {
+      console.error(
+        '\nRefusing to run: rewriting links with this map would point them at files\n' +
+          'that no longer exist. Rebuild the map against the current target tree:\n' +
+          '\n    node buildIdMap.js\n' +
+          '\nor re-run this script with --rebuild-map to do it automatically.',
+      );
+      process.exit(1);
+    }
+
+    console.log('\n--rebuild-map: rebuilding id-map.json from SOURCE/TARGET…');
+    if (!SOURCE_FOLDER_ID) {
+      console.error('SOURCE_FOLDER_ID is not set — cannot rebuild. Set it in .env.');
+      process.exit(1);
+    }
+    const rebuilt = await buildIdMap(drive, {
+      sourceFolderId: SOURCE_FOLDER_ID,
+      targetFolderId: TARGET_FOLDER_ID,
+      write: true,
+    });
+    idMap = rebuilt.idMap;
+    ({ allItems } = await listTarget(drive, TARGET_FOLDER_ID));
+    stale = await validateIdMap();
+    if (stale.length > 0) {
+      console.error(
+        `\nStill ${stale.length} unresolvable entries after rebuild — aborting.`,
+      );
+      process.exit(1);
+    }
+    console.log(`id-map:  rebuilt, ${Object.keys(idMap).length} entries, all valid`);
+  } else {
+    console.log(`id-map:  all ${Object.keys(idMap).length} target ids verified present`);
+  }
+
   const targets = allItems.filter(
     (f) => KIND_BY_MIME[f.mimeType] && kindEnabled(KIND_BY_MIME[f.mimeType]),
   );
@@ -506,6 +581,7 @@ async function main() {
   // Docs reuse the existing resolver context from updateDocLinks.js (which
   // additionally does its own name-based fallback).
   const docCtx = {
+    dryRun: DRY_RUN,
     idMap,
     targetNameIndex: new Map(),
     targetIdSet: targetIds,
@@ -584,21 +660,18 @@ async function main() {
     try {
       let result;
       if (kind === 'docs') {
-        if (DRY_RUN) {
-          // processDoc writes as it goes, so it is not safe to call in dry run.
-          result = { changes: [], unresolved: [], modified: false, skipped: true };
-        } else {
-          const r = await processDoc(docsApi, drive, file, docCtx);
-          result = {
-            changes: r.successReplacements.map((s) => ({
-              from: s.originalUrl,
-              to: s.newUrl,
-              kind: s.replacedAs ?? 'link',
-            })),
-            unresolved: r.failures,
-            modified: r.modified,
-          };
-        }
+        // processDoc honours ctx.dryRun: it still walks and reports, but sends
+        // no batchUpdate, so a dry run covers Docs like every other type.
+        const r = await processDoc(docsApi, drive, file, docCtx);
+        result = {
+          changes: r.successReplacements.map((s) => ({
+            from: s.originalUrl,
+            to: s.newUrl,
+            kind: s.replacedAs ?? 'link',
+          })),
+          unresolved: r.failures,
+          modified: r.modified,
+        };
       } else if (kind === 'sheets') {
         result = await processSheet(sheetsApi, file, resolve);
       } else {
@@ -755,7 +828,6 @@ async function main() {
 
   if (DRY_RUN) {
     console.log('\nDRY RUN — nothing was written. Re-run without --dry-run to apply.');
-    console.log('(Google Docs are skipped in dry run; use --only=docs to apply them.)');
   } else if (stats.byKind.docx || stats.byKind.xlsx) {
     console.log('\n.docx/.xlsx changes were uploaded as new revisions —');
     console.log('revert from Drive → right-click file → Manage versions.');
