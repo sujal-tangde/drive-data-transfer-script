@@ -541,6 +541,68 @@ export async function listChildren(drive, folderId) {
 }
 
 /**
+ * Authoritative "does a child folder with this name already exist?" check,
+ * hitting Drive directly rather than a cached listing. Used immediately before
+ * creating a folder so that a subtree left behind by an earlier (partial) run —
+ * whose folders never appear in this run's in-memory snapshot — is adopted
+ * instead of re-created. Returns every non-trashed folder child of `parentId`
+ * with exactly `name`, so the caller can also detect pre-existing duplicates.
+ */
+export async function findChildFoldersByName(drive, parentId, name) {
+  // Escape single quotes for the query literal ("Foo's" -> "Foo\'s").
+  const safeName = name.replace(/'/g, "\\'");
+  const q =
+    `'${parentId}' in parents and trashed = false` +
+    ` and mimeType = '${FOLDER_MIME}' and name = '${safeName}'`;
+  const all = [];
+  let pageToken;
+
+  do {
+    const res = await driveCall('read', `files.list ${parentId} name=${name}`, () =>
+      drive.files.list({
+        q,
+        pageSize: 1000,
+        pageToken: pageToken || undefined,
+        fields: 'nextPageToken, files(id, name, mimeType)',
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+      }),
+    );
+    for (const f of res.data.files ?? []) {
+      if (f.id) all.push(f);
+    }
+    pageToken = res.data.nextPageToken;
+  } while (pageToken);
+
+  return all;
+}
+
+/**
+ * Serializes an async operation per key: concurrent callers with the same key
+ * run one after another, callers with different keys run in parallel. Used to
+ * make "check the target for folder X, then create it if absent" atomic against
+ * a sibling walker (or a retry) doing the same for the same parent+name — the
+ * window in which a lost race would otherwise create a duplicate folder.
+ */
+const keyedLocks = new Map();
+export async function withKeyedLock(key, fn) {
+  const prev = keyedLocks.get(key) ?? Promise.resolve();
+  let release;
+  const next = new Promise((resolve) => {
+    release = resolve;
+  });
+  keyedLocks.set(key, prev.then(() => next));
+  await prev.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    // Drop the entry if we are the tail, so the map does not grow unbounded.
+    if (keyedLocks.get(key) === next) keyedLocks.delete(key);
+  }
+}
+
+/**
  * Prints a fixed status block once per interval from whatever lines the caller
  * renders. Plain console lines only — no cursor tricks — so retry/warn logs
  * stay readable.

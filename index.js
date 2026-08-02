@@ -36,6 +36,7 @@ import {
   driveCall,
   ERROR_DETAIL_LOG,
   FILE_QUEUE_MAX,
+  findChildFoldersByName,
   flushIssues,
   FOLDER_MIME,
   formatDuration,
@@ -54,6 +55,7 @@ import {
   tagFailure,
   truncateName,
   VERBOSE,
+  withKeyedLock,
   WALK_CONCURRENCY,
   WRITE_RATE,
   WRITE_RATE_MAX,
@@ -351,56 +353,73 @@ async function walkFolder(drive, job, ctx) {
       }
       visited.add(id);
 
-      const existingFolders = (targetByName.get(name) ?? []).filter(
-        (c) => c.mimeType === FOLDER_MIME && c.id,
-      );
-
       let targetId;
       let targetKnownEmpty = false;
-      if (existingFolders.length > 0) {
-        targetId = existingFolders[0].id;
-        stats.foldersReused += 1;
-        if (existingFolders.length > 1) {
-          stats.foldersAmbiguous += 1;
-          const message = `${existingFolders.length} target folders named "${name}"; continuing in the first`;
-          appendIssue('ambiguous-folder', message);
-          // Not a failure, but the duplicate-name case the detail log is for:
-          // without the ids there is no way to tell the copies apart later.
-          appendErrorDetail('ambiguous-folder', `folder ${name}`, message, {
-            operation: 'files.list',
-            copyMode,
-            sourceFile: { id, name, mimeType },
-            targetFile: { id: targetId, name },
-            sourceFolder: { id: job.sourceId, path: job.sourcePath },
-            targetFolder: { id: job.targetId, path: job.targetPath },
-            targetFileIds: existingFolders.map((f) => f.id),
+
+      // Resolve-or-create is serialized per (target parent + name) and reads the
+      // target from Drive rather than from `targetByName`. The cached snapshot
+      // only reflects folders present when this walker listed the parent, so a
+      // subtree left by an earlier partial run — or a duplicate created earlier
+      // in this run — is invisible to it, and the old code would create a second
+      // copy. The authoritative lookup inside the lock closes that window: any
+      // existing folder is adopted, and only one create can win per name.
+      await withKeyedLock(`folder:${job.targetId}:${name}`, async () => {
+        const existingFolders = await findChildFoldersByName(drive, job.targetId, name).catch(
+          (err) => {
+            throw tagFailure(err, 'files.list', {
+              side: 'target',
+              failedFileId: job.targetId,
+              sourceFile: { id, name, mimeType },
+            });
+          },
+        );
+
+        if (existingFolders.length > 0) {
+          targetId = existingFolders[0].id;
+          stats.foldersReused += 1;
+          if (existingFolders.length > 1) {
+            // Pre-existing duplicates in the target (e.g. left by a run made
+            // before this fix). Reported, not created — this branch never adds
+            // a folder, so it cannot make the situation worse.
+            stats.foldersAmbiguous += 1;
+            const message = `${existingFolders.length} target folders named "${name}"; continuing in the first`;
+            appendIssue('ambiguous-folder', message);
+            appendErrorDetail('ambiguous-folder', `folder ${name}`, message, {
+              operation: 'files.list',
+              copyMode,
+              sourceFile: { id, name, mimeType },
+              targetFile: { id: targetId, name },
+              sourceFolder: { id: job.sourceId, path: job.sourcePath },
+              targetFolder: { id: job.targetId, path: job.targetPath },
+              targetFileIds: existingFolders.map((f) => f.id),
+            });
+          }
+          if (VERBOSE) console.log(`Using existing folder: ${name}`);
+        } else {
+          const created = await driveCall('write', `files.create folder ${name}`, () =>
+            drive.files.create({
+              requestBody: {
+                name,
+                mimeType: FOLDER_MIME,
+                parents: [job.targetId],
+              },
+              fields: 'id',
+              supportsAllDrives: true,
+            }),
+          ).catch((err) => {
+            // The id sent to files.create is the parent the folder goes into.
+            throw tagFailure(err, 'files.create', {
+              failedFileId: job.targetId,
+              sourceFile: { id, name, mimeType },
+            });
           });
+          targetId = created.data.id;
+          if (!targetId) throw new Error(`Folder create returned no id for ${name}`);
+          stats.foldersCreated += 1;
+          targetKnownEmpty = true;
+          if (VERBOSE) console.log(`Created folder: ${name}`);
         }
-        if (VERBOSE) console.log(`Using existing folder: ${name}`);
-      } else {
-        const created = await driveCall('write', `files.create folder ${name}`, () =>
-          drive.files.create({
-            requestBody: {
-              name,
-              mimeType: FOLDER_MIME,
-              parents: [job.targetId],
-            },
-            fields: 'id',
-            supportsAllDrives: true,
-          }),
-        ).catch((err) => {
-          // The id sent to files.create is the parent the folder goes into.
-          throw tagFailure(err, 'files.create', {
-            failedFileId: job.targetId,
-            sourceFile: { id, name, mimeType },
-          });
-        });
-        targetId = created.data.id;
-        if (!targetId) throw new Error(`Folder create returned no id for ${name}`);
-        stats.foldersCreated += 1;
-        targetKnownEmpty = true;
-        if (VERBOSE) console.log(`Created folder: ${name}`);
-      }
+      });
 
       queues.folders.push({
         sourceId: id,
