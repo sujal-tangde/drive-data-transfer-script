@@ -8,13 +8,15 @@
   "scripts": {
     "start": "node index.js",
     "verify": "node verify.js",
-    "getMissing": "node getMissing.js"
+    "getMissing": "node getMissing.js",
+    "updateAllLinks": "node updateAllLinks.js"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
-    "googleapis": "^144.0.0"
+    "googleapis": "^144.0.0",
+    "jszip": "^3.10.1"
   }
 }
