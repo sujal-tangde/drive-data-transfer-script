@@ -44,10 +44,14 @@ import { Readable } from 'node:stream';
 import { google } from 'googleapis';
 import JSZip from 'jszip';
 import {
+  createStatusPrinter,
   driveCall,
+  formatDuration,
   isMainModule,
   runPool,
   DOC_CONCURRENCY,
+  LOG_INTERVAL_MS,
+  VERBOSE,
 } from './driveUtils.js';
 import {
   authorize,
@@ -514,11 +518,69 @@ async function main() {
 
   const changesLog = [];
   const failuresLog = [];
-  let modifiedCount = 0;
-  let processed = 0;
+
+  /** Live counters, rendered by the status block and reused in the final report. */
+  const stats = {
+    processed: 0,
+    modified: 0,
+    unchanged: 0,
+    linksReplaced: 0,
+    linksUnresolved: 0,
+    errors: 0,
+    byKind: { docs: 0, sheets: 0, docx: 0, xlsx: 0 },
+  };
+  const ctl = { aborted: false, inFlight: new Set() };
+  const startedAt = Date.now();
+
+  // Same two-line status block style as index.js, on the same LOG_INTERVAL_MS.
+  const status = createStatusPrinter(() => {
+    const elapsed = Date.now() - startedAt;
+    const rate = stats.processed / Math.max(1, elapsed / 1000);
+    const remaining = Math.max(0, targets.length - stats.processed);
+    const pct = targets.length ? (stats.processed / targets.length) * 100 : 0;
+
+    const l1 = [
+      `[progress] ${stats.processed}/${targets.length} (${pct.toFixed(1)}%)`,
+      `${stats.modified} modified`,
+      `${stats.unchanged} unchanged`,
+      `${stats.linksReplaced} links replaced`,
+    ];
+    if (stats.linksUnresolved) l1.push(`${stats.linksUnresolved} unresolved`);
+    if (stats.errors) l1.push(`${stats.errors} errors`);
+    l1.push(
+      `${rate.toFixed(1)} files/s`,
+      `elapsed ${formatDuration(elapsed)}`,
+      `ETA ${rate > 0 ? formatDuration((remaining / rate) * 1000) : '--:--:--'}`,
+    );
+
+    const l2 = [
+      `[types]    docs ${stats.byKind.docs}`,
+      `sheets ${stats.byKind.sheets}`,
+      `docx ${stats.byKind.docx}`,
+      `xlsx ${stats.byKind.xlsx}`,
+    ];
+    const active = [...ctl.inFlight].slice(0, 2).join(', ');
+    if (active) l2.push(`| now: ${active}`);
+
+    return [l1.join(', '), l2.join(', ')];
+  });
+
+  // Ctrl+C finishes in-flight files rather than truncating a half-written
+  // upload — the same graceful-abort contract index.js uses.
+  const onInterrupt = () => {
+    if (ctl.aborted) return;
+    ctl.aborted = true;
+    console.log('\n[abort] Finishing in-flight files… (Ctrl+C again to force quit)');
+  };
+  process.on('SIGINT', onInterrupt);
+
+  console.log(`Status printed every ${LOG_INTERVAL_MS}ms.\n`);
+  status.start();
 
   await runPool(targets, DOC_CONCURRENCY, async (file) => {
     const kind = KIND_BY_MIME[file.mimeType];
+    if (ctl.aborted) return;
+    ctl.inFlight.add(file.name);
     try {
       let result;
       if (kind === 'docs') {
@@ -543,7 +605,18 @@ async function main() {
         result = await processOoxml(drive, file, resolve);
       }
 
-      if (result.modified) modifiedCount += 1;
+      if (result.modified) {
+        stats.modified += 1;
+        stats.byKind[kind] += 1;
+        if (VERBOSE) {
+          console.log(`  [${kind}] ${file.name}: ${result.changes.length} link(s) updated`);
+        }
+      } else {
+        stats.unchanged += 1;
+      }
+      stats.linksReplaced += result.changes.length;
+      stats.linksUnresolved += result.unresolved.length;
+
       if (result.changes.length) {
         changesLog.push({
           file: file.name,
@@ -607,14 +680,16 @@ async function main() {
           fileKind: kind,
         },
       });
-      console.warn(`  ! ${file.name}: ${err?.message ?? err}`);
+      stats.errors += 1;
+      console.warn(`  ! [${kind}] ${file.name}: ${err?.message ?? err}`);
     } finally {
-      processed += 1;
-      if (processed % 25 === 0) {
-        console.log(`  …${processed}/${targets.length}`);
-      }
+      stats.processed += 1;
+      ctl.inFlight.delete(file.name);
     }
   });
+
+  status.stop();
+  process.off('SIGINT', onInterrupt);
 
   /* ---- logs ---- */
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -622,14 +697,23 @@ async function main() {
   await fs.mkdir(dir, { recursive: true });
 
   const totalChanges = changesLog.reduce((n, f) => n + f.changes.length, 0);
+  const elapsedMs = Date.now() - startedAt;
   const summary = {
     ranAt: new Date().toISOString(),
+    runId: RUN_ID,
     dryRun: DRY_RUN,
+    aborted: ctl.aborted,
     types: enabled,
+    elapsedMs,
     filesScanned: targets.length,
+    filesProcessed: stats.processed,
     filesByType: byKind,
-    filesModified: modifiedCount,
+    filesModified: stats.modified,
+    filesUnchanged: stats.unchanged,
+    modifiedByType: stats.byKind,
     linksReplaced: totalChanges,
+    linksUnresolved: stats.linksUnresolved,
+    fileErrors: stats.errors,
     filesWithUnresolved: failuresLog.length,
     errorsLogged: linkErrorCount,
     errorLog: path.relative(process.cwd(), LINK_ERROR_LOG),
@@ -639,27 +723,45 @@ async function main() {
   await fs.writeFile(path.join(dir, 'changes.json'), JSON.stringify(changesLog, null, 2));
   await fs.writeFile(path.join(dir, 'failures.json'), JSON.stringify(failuresLog, null, 2));
 
-  // Wait for every queued append to hit disk before reporting/exiting.
+  // Every queued append must hit disk before we report or exit.
   await errorWriteChain;
 
-  console.log('\n──────── summary ────────');
-  console.log(`files scanned:    ${summary.filesScanned}`);
-  console.log(`files modified:   ${summary.filesModified}`);
-  console.log(`links replaced:   ${summary.linksReplaced}`);
-  console.log(`files w/ issues:  ${summary.filesWithUnresolved}`);
-  console.log(`logs:             ${path.relative(process.cwd(), dir)}`);
-  if (linkErrorCount > 0) {
+  console.log(ctl.aborted ? '\nInterrupted.' : '\nDone.');
+  console.log(`  Mode:             ${DRY_RUN ? 'DRY RUN (nothing written)' : 'APPLY'}`);
+  console.log(`  Elapsed:          ${formatDuration(elapsedMs)}`);
+  console.log(`  Files scanned:    ${targets.length}`);
+  console.log(`  Files processed:  ${stats.processed}`);
+  console.log(`  Files modified:   ${stats.modified}`);
+  console.log(`  Files unchanged:  ${stats.unchanged}`);
+  console.log(
+    `    by type:        docs ${stats.byKind.docs}, sheets ${stats.byKind.sheets}, ` +
+      `docx ${stats.byKind.docx}, xlsx ${stats.byKind.xlsx}`,
+  );
+  console.log(`  Links replaced:   ${totalChanges}`);
+  if (stats.linksUnresolved) {
     console.log(
-      `errors logged:    ${linkErrorCount} -> ${path.relative(process.cwd(), LINK_ERROR_LOG)}`,
+      `  Links unresolved: ${stats.linksUnresolved} (id not in id-map — left untouched)`,
     );
   }
+  if (stats.errors) {
+    console.log(`  File errors:      ${stats.errors}`);
+  }
+  console.log(`  Run logs:         ${path.relative(process.cwd(), dir)}`);
+  if (linkErrorCount > 0) {
+    console.log(
+      `  Error log:        ${path.relative(process.cwd(), LINK_ERROR_LOG)} (+${linkErrorCount} line(s))`,
+    );
+  }
+
   if (DRY_RUN) {
     console.log('\nDRY RUN — nothing was written. Re-run without --dry-run to apply.');
     console.log('(Google Docs are skipped in dry run; use --only=docs to apply them.)');
-  } else {
+  } else if (stats.byKind.docx || stats.byKind.xlsx) {
     console.log('\n.docx/.xlsx changes were uploaded as new revisions —');
     console.log('revert from Drive → right-click file → Manage versions.');
   }
+
+  if (ctl.aborted) process.exitCode = 130;
 }
 
 if (isMainModule(import.meta.url)) {
