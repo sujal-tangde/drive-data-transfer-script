@@ -4,11 +4,12 @@
  * Handles four formats, in two very different ways:
  *
  *   NATIVE (edited in place through Google APIs)
- *     • Google Docs    — delegates to processDoc() from updateDocLinks.js, so
- *                        smart chips / hyperlinks / plain URLs behave exactly
- *                        as they do in the existing, proven tool.
+ *     • Google Docs    — hyperlinks, plain-text URLs, and smart chips (which
+ *                        become ordinary hyperlinks labelled with the file
+ *                        name). Body, tables, headers, footers and footnotes.
  *     • Google Sheets  — ALL tabs. Rewrites =HYPERLINK() formulas, rich-text
- *                        run links, cell-level text links, and plain URLs.
+ *                        run links, cell-level text links, plain URLs, and
+ *                        smart chips (also converted to name-labelled links).
  *
  *   OOXML (downloaded, rewritten, re-uploaded as a new revision)
  *     • .docx  • .xlsx — Office files are zipped XML. Google has no API to edit
@@ -18,25 +19,25 @@
  *                        Drive keeps version history, so a bad run is
  *                        revertable from "Manage versions".
  *
- * All four share one source of truth: id-map.json (old Drive id -> new Drive id),
- * built by buildIdMap.js from path-matching the source and target trees.
+ * All four share one source of truth: id-map.json (old Drive id -> new Drive id).
+ * It is REBUILT FROM SCRATCH on every run — the old file is deleted first and a
+ * fresh one written by path-matching the source and target trees. A map carried
+ * over between runs is the single most dangerous input this script can have: it
+ * still resolves, but its values name files an earlier migration created and
+ * later replaced, so every "fixed" link silently points at a deleted file.
+ * Deriving it fresh each time removes that failure mode entirely.
  *
  * REQUIREMENTS
- *   npm install jszip          <-- new dependency, needed for .docx/.xlsx only
- *   .env: TARGET_FOLDER_ID (required), SOURCE_FOLDER_ID (to build the id-map)
+ *   npm install jszip
+ *   .env: SOURCE_FOLDER_ID and TARGET_FOLDER_ID (both required — the map is
+ *         rebuilt every run, which needs both trees)
  *   credentials.json + token.json (same OAuth as the rest of the toolkit)
- *
- * Before writing anything, every id the map points AT is checked against the
- * target tree. A map left over from an earlier migration still resolves but
- * names files that no longer exist, which produces a run that reports success
- * while pointing every link at a dead id — see the preflight in main().
  *
  * USAGE
  *   node updateAllLinks.js --dry-run          # report only, change nothing
  *   node updateAllLinks.js                    # apply to all four types
  *   node updateAllLinks.js --only=sheets      # docs | sheets | docx | xlsx (comma-sep)
  *   node updateAllLinks.js --skip=docx,xlsx   # inverse of --only
- *   node updateAllLinks.js --rebuild-map      # rebuild a stale id-map instead of aborting
  *
  * OUTPUT
  *   logs/linkfix-<timestamp>/{summary.json, changes.json, failures.json}
@@ -51,6 +52,7 @@ import { google } from 'googleapis';
 import JSZip from 'jszip';
 import {
   createStatusPrinter,
+  docsCall,
   driveCall,
   formatDuration,
   isMainModule,
@@ -59,13 +61,6 @@ import {
   LOG_INTERVAL_MS,
   VERBOSE,
 } from './driveUtils.js';
-import {
-  authorize,
-  extractDriveId,
-  listTarget,
-  loadOrBuildIdMap,
-  processDoc,
-} from './updateDocLinks.js';
 import { buildIdMap } from './buildIdMap.js';
 
 /* ------------------------------------------------------------------ config */
@@ -73,6 +68,7 @@ import { buildIdMap } from './buildIdMap.js';
 const TARGET_FOLDER_ID = process.env.TARGET_FOLDER_ID;
 const SOURCE_FOLDER_ID = process.env.SOURCE_FOLDER_ID;
 const LOGS_BASE_DIR = path.join(process.cwd(), 'logs');
+const ID_MAP_PATH = process.env.ID_MAP_PATH || path.join(process.cwd(), 'id-map.json');
 
 /**
  * Every problem this script hits — both hard failures and links it could not
@@ -127,9 +123,6 @@ const KIND_BY_MIME = {
 };
 
 const DRY_RUN = process.argv.includes('--dry-run');
-
-/** Rebuild id-map.json in place instead of aborting when it has gone stale. */
-const REBUILD_MAP = process.argv.includes('--rebuild-map');
 
 function listArg(flag) {
   const hit = process.argv.find((a) => a.startsWith(`${flag}=`));
@@ -238,7 +231,432 @@ function rewriteUrlsInText(text, resolve) {
   return { text: out, changes, unresolved };
 }
 
+/* -------------------------------------------------------------------- auth */
+
+const CREDENTIALS_PATH =
+  process.env.GOOGLE_OAUTH_CREDENTIALS || path.join(process.cwd(), 'credentials.json');
+const TOKEN_PATH =
+  process.env.GOOGLE_OAUTH_TOKEN || path.join(process.cwd(), 'token.json');
+
+async function authorize() {
+  const credentials = JSON.parse(await fs.readFile(CREDENTIALS_PATH, 'utf8'));
+  const { client_id, client_secret, redirect_uris } =
+    credentials.installed || credentials.web;
+  const oAuth2Client = new google.auth.OAuth2(
+    client_id,
+    client_secret,
+    (redirect_uris && redirect_uris[0]) || 'http://localhost',
+  );
+  oAuth2Client.setCredentials(JSON.parse(await fs.readFile(TOKEN_PATH, 'utf8')));
+  return oAuth2Client;
+}
+
+/** First id-looking token in a Drive URL: /d/<id>, ?id=<id>, or /folders/<id>. */
+export function extractDriveId(url) {
+  if (!url) return null;
+  let m = url.match(/\/d\/([a-zA-Z0-9_-]{15,})/);
+  if (m) return m[1];
+  m = url.match(/[?&]id=([a-zA-Z0-9_-]{15,})/);
+  if (m) return m[1];
+  m = url.match(/\/folders\/([a-zA-Z0-9_-]{15,})/);
+  if (m) return m[1];
+  return null;
+}
+
+/* ----------------------------------------------------------- Google Docs */
+
+/**
+ * Docs edits are index-based, and any edit that changes the document length
+ * invalidates every index after it. processDoc therefore splits edits in two:
+ *
+ *   non-shifting  updateTextStyle to retarget an existing hyperlink. The text
+ *                 is untouched, so all indices from the walk stay valid.
+ *   shifting      smart chips (which have no mutable URI, so they are deleted
+ *                 and re-inserted as hyperlinked text) and runs whose visible
+ *                 text contains an old URL.
+ *
+ * Non-shifting edits go first, in one batch, against the walked indices.
+ * Shifting edits then go in a single batch sorted highest-index-first, so each
+ * one only moves text that later requests do not refer to. Splitting shifting
+ * edits across batches computed from the same snapshot silently shreds the
+ * document — that bug is what this ordering exists to prevent.
+ */
+
+function* walkParagraphs(structuralElements, state = { pIndex: 0 }, segmentId = '') {
+  for (const block of structuralElements || []) {
+    if (block.paragraph) {
+      yield { paragraph: block.paragraph, paragraphIndex: state.pIndex, segmentId };
+      state.pIndex += 1;
+    } else if (block.table) {
+      for (const row of block.table.tableRows || []) {
+        for (const cell of row.tableCells || []) {
+          yield* walkParagraphs(cell.content || [], state, segmentId);
+        }
+      }
+    } else if (block.tableOfContents) {
+      yield* walkParagraphs(block.tableOfContents.content || [], state, segmentId);
+    }
+  }
+}
+
+/**
+ * Every paragraph in the document — body first, then headers, footers and
+ * footnotes.
+ *
+ * Docs indices are per-SEGMENT, not document-wide: index 42 in a header is a
+ * different character from index 42 in the body. Every yielded paragraph
+ * therefore carries the segmentId its indices belong to, and any range built
+ * from them must carry it too.
+ */
+function* walkDocument(doc, state = { pIndex: 0 }) {
+  yield* walkParagraphs(doc.body?.content || [], state, '');
+  for (const group of ['headers', 'footers', 'footnotes']) {
+    for (const [segmentId, segment] of Object.entries(doc[group] || {})) {
+      yield* walkParagraphs(segment.content || [], state, segmentId);
+    }
+  }
+}
+
+/** Docs Range/Location omit segmentId for the body and require it elsewhere. */
+function docRange(segmentId, startIndex, endIndex) {
+  return segmentId ? { segmentId, startIndex, endIndex } : { startIndex, endIndex };
+}
+
+function docLocation(segmentId, index) {
+  return segmentId ? { segmentId, index } : { index };
+}
+
+/** Replace every occurrence of `find` in `text` — no regex escaping needed. */
+function replaceAllLiteral(text, find, replacement) {
+  return text.split(find).join(replacement);
+}
+
+function snippetFromText(text, maxLen = 80) {
+  if (!text) return '';
+  const cleaned = text.replace(/\s+/g, ' ').trim();
+  return cleaned.length <= maxLen ? cleaned : cleaned.slice(0, maxLen - 1) + '…';
+}
+
+/**
+ * Anchor text to give a smart chip once it becomes a plain hyperlink.
+ *
+ * Preference order:
+ *   1. the TARGET file's current name — authoritative, since that is the file
+ *      the rewritten link actually points at;
+ *   2. the chip's own title — the source file's name as Docs last rendered it,
+ *      used when the target is outside the scanned tree;
+ *   3. the URL — last resort, so a chip is never turned into an empty link.
+ *
+ * Names for everything inside the target tree come from the listing already in
+ * hand, so the common case costs no API call. Anything else is fetched once and
+ * cached; concurrent docs referencing the same chip share one lookup.
+ */
+async function chipDisplayText(drive, newId, props, fallbackUrl, ctx) {
+  const fromListing = ctx.targetNameById?.get(newId);
+  if (fromListing) return fromListing;
+
+  const title = (props.title || '').trim();
+  if (title) return title;
+
+  if (!drive) return fallbackUrl;
+
+  ctx.newIdNameCache ??= new Map();
+  if (!ctx.newIdNameCache.has(newId)) {
+    ctx.newIdNameCache.set(
+      newId,
+      driveCall('read', `files.get(name) ${newId}`, () =>
+        drive.files.get({ fileId: newId, fields: 'name', supportsAllDrives: true }),
+      )
+        .then((res) => res.data.name || null)
+        .catch(() => null),
+    );
+  }
+  return (await ctx.newIdNameCache.get(newId)) || fallbackUrl;
+}
+
+/**
+ * Resolve an old Drive id to its replacement.
+ *
+ * The map is rebuilt every run, so it is authoritative; the remaining cases are
+ * ids the map has nothing to say about. An id already living in the target is
+ * treated as correct (that is what makes re-runs no-ops), and an id still in
+ * the source tree is left alone rather than guessed at.
+ *
+ * @returns {Promise<{newId: string, source: string} | null>} null = unresolvable
+ */
+async function resolveOldId(drive, oldId, ctx) {
+  if (!oldId) return null;
+  if (ctx.idMap[oldId]) return { newId: ctx.idMap[oldId], source: 'id-map' };
+  if (ctx.targetIdSet?.has(oldId)) return { newId: oldId, source: 'already-in-target' };
+  if (ctx.sourceIdSet?.has(oldId)) return { newId: oldId, source: 'already-in-source' };
+  return null;
+}
+
+export async function processDoc(docs, drive, fileEntry, ctx) {
+  const docResp = await docsCall(`docs.get ${fileEntry.name}`, () =>
+    docs.documents.get({ documentId: fileEntry.id }),
+  );
+  const doc = docResp.data;
+  const dryRun = Boolean(ctx.dryRun);
+
+  /**
+   * NON-SHIFTING edits: { segmentId, startIndex, endIndex, url }
+   * updateTextStyle only — the visible text never changes.
+   */
+  const retargets = [];
+
+  /**
+   * SHIFTING edits: { segmentId, startIndex, endIndex, text, style, fields }
+   * delete → insert → restyle, applied highest-index-first.
+   */
+  const rewrites = [];
+
+  const successReplacements = [];
+  const failures = [];
+
+  /**
+   * Links that already point at the right file. Neither a failure nor a
+   * replacement: emitting an edit would rewrite a URL to itself, burn a
+   * revision, and report "N links replaced" on a run that changed nothing.
+   */
+  let alreadyCorrect = 0;
+
+  const isRewritable = (resolved, oldId) =>
+    resolved &&
+    resolved.source !== 'already-in-source' &&
+    (resolved.newId !== oldId || resolved.source === 'already-in-target');
+
+  for (const { paragraph, paragraphIndex, segmentId } of walkDocument(doc)) {
+    const elements = paragraph.elements || [];
+    const snippet = snippetFromText(
+      elements
+        .map((e) => e.textRun?.content || e.richLink?.richLinkProperties?.title || '')
+        .join(''),
+    );
+
+    for (const el of elements) {
+      // ---- Smart chips (richLink) ----
+      if (el.richLink) {
+        const props = el.richLink.richLinkProperties || {};
+        const uri = props.uri;
+        if (!uri || !isDocsOrDriveUrl(uri)) continue; // e.g. a YouTube chip
+
+        const oldId = extractDriveId(uri);
+        const resolved = await resolveOldId(drive, oldId, ctx);
+        if (!resolved) {
+          failures.push({ url: uri, reason: 'MISSING_IN_ID_MAP', paragraphIndex, textSnippet: snippet });
+          continue;
+        }
+        if (!isRewritable(resolved, oldId)) continue;
+
+        const newUrl = replaceIdInUrl(uri, oldId, resolved.newId);
+        if (newUrl === uri) {
+          alreadyCorrect += 1; // chip already points into the target
+          continue;
+        }
+
+        // The chip becomes a normal hyperlink labelled with the file's name, so
+        // the paragraph still reads as prose instead of a wall of URL.
+        const displayText = await chipDisplayText(drive, resolved.newId, props, newUrl, ctx);
+
+        // A chip is one index unit; it becomes a URL-length string, so this
+        // always lengthens the segment — strictly a shifting edit.
+        rewrites.push({
+          segmentId,
+          startIndex: el.startIndex,
+          endIndex: el.endIndex,
+          text: displayText,
+          style: { link: { url: newUrl } },
+          fields: 'link',
+        });
+        successReplacements.push({
+          originalUrl: uri,
+          newUrl,
+          replacedAs: 'SMART_CHIP_CONVERTED_TO_HYPERLINK',
+          matchedBy: resolved.source,
+          displayText,
+          paragraphIndex,
+          textSnippet: snippet,
+        });
+        continue;
+      }
+
+      if (el.person) continue; // person chips carry no doc URL
+      if (!el.textRun) continue;
+
+      const tr = el.textRun;
+      const content = tr.content || '';
+      const linkUrl = tr.textStyle?.link?.url;
+
+      // ---- The run's hyperlink target (where the text points) ----
+      let newLinkUrl = null;
+      if (linkUrl && isDocsOrDriveUrl(linkUrl)) {
+        const oldId = extractDriveId(linkUrl);
+        const resolved = await resolveOldId(drive, oldId, ctx);
+        if (!resolved) {
+          failures.push({ url: linkUrl, reason: 'MISSING_IN_ID_MAP', paragraphIndex, textSnippet: snippet });
+        } else if (isRewritable(resolved, oldId)) {
+          const candidate = replaceIdInUrl(linkUrl, oldId, resolved.newId);
+          if (candidate === linkUrl) {
+            alreadyCorrect += 1;
+          } else {
+            newLinkUrl = candidate;
+            successReplacements.push({
+              originalUrl: linkUrl,
+              newUrl: newLinkUrl,
+              replacedAs: 'HYPERLINK_RETARGETED',
+              matchedBy: resolved.source,
+              paragraphIndex,
+              textSnippet: snippet,
+            });
+          }
+        }
+      }
+      // Other domains are out of scope and left alone.
+
+      // ---- Drive URLs sitting in the run's VISIBLE TEXT ----
+      // A URL that is also the run's link target was already resolved and
+      // logged above; reuse that result rather than reporting it twice.
+      let newContent = content;
+      for (const url of content.match(GOOGLE_URL_REGEX) || []) {
+        let newUrl;
+        if (linkUrl && url === linkUrl) {
+          newUrl = newLinkUrl;
+        } else {
+          const oldId = extractDriveId(url);
+          const resolved = await resolveOldId(drive, oldId, ctx);
+          if (!resolved) {
+            failures.push({ url, reason: 'MISSING_IN_ID_MAP', paragraphIndex, textSnippet: snippet });
+            continue;
+          }
+          if (!isRewritable(resolved, oldId)) continue;
+          newUrl = replaceIdInUrl(url, oldId, resolved.newId);
+          if (newUrl === url) {
+            alreadyCorrect += 1;
+            continue;
+          }
+          successReplacements.push({
+            originalUrl: url,
+            newUrl,
+            replacedAs: 'TEXT_URL_REWRITTEN',
+            matchedBy: resolved.source,
+            paragraphIndex,
+            textSnippet: snippet,
+          });
+        }
+        if (newUrl && newUrl !== url) {
+          newContent = replaceAllLiteral(newContent, url, newUrl);
+        }
+      }
+
+      if (newContent !== content) {
+        // The text itself has to change: delete → insert → restyle. The whole
+        // run is replaced in one edit, which keeps every shifting edit on a
+        // disjoint range and makes the descending-order pass below sound.
+        let startIndex = el.startIndex;
+        let endIndex = el.endIndex;
+        let text = newContent;
+
+        // A run that ends a paragraph includes the paragraph mark. Deleting it
+        // merges this paragraph into the next, so keep it out of the range.
+        if (content.endsWith('\n')) {
+          endIndex -= 1;
+          text = text.slice(0, -1);
+        }
+
+        if (endIndex > startIndex && text.length > 0) {
+          // insertText inherits formatting from the preceding character, so the
+          // run's own style is captured and re-applied over the inserted range —
+          // otherwise bold/size/colour would be lost on every rewrite.
+          const style = { ...(tr.textStyle || {}) };
+          const finalLink = newLinkUrl || linkUrl;
+          if (finalLink) style.link = { url: finalLink };
+          else delete style.link;
+          const fields = [...new Set([...Object.keys(style), 'link'])].join(',');
+
+          rewrites.push({ segmentId, startIndex, endIndex, text, style, fields });
+        }
+      } else if (newLinkUrl) {
+        // Text unchanged — only the link target moves. updateTextStyle does that
+        // without touching a character, so it neither loses the anchor text nor
+        // shifts any index.
+        let endIndex = el.endIndex;
+        if (content.endsWith('\n')) endIndex -= 1;
+        if (endIndex > el.startIndex) {
+          retargets.push({ segmentId, startIndex: el.startIndex, endIndex, url: newLinkUrl });
+        }
+      }
+    }
+  }
+
+  const modified = retargets.length > 0 || rewrites.length > 0;
+  if (dryRun) return { successReplacements, failures, modified, alreadyCorrect };
+
+  // ---- Batch 1: retargets (non-shifting) ----
+  // Must go FIRST, while the document still matches what the walk saw.
+  if (retargets.length > 0) {
+    await docsCall(`docs.batchUpdate(retarget) ${fileEntry.name}`, () =>
+      docs.documents.batchUpdate({
+        documentId: fileEntry.id,
+        requestBody: {
+          requests: retargets.map((r) => ({
+            updateTextStyle: {
+              range: docRange(r.segmentId, r.startIndex, r.endIndex),
+              textStyle: { link: { url: r.url } },
+              fields: 'link',
+            },
+          })),
+        },
+      }),
+    );
+  }
+
+  // ---- Batch 2: every length-changing edit, highest index first ----
+  // Requests inside one batchUpdate apply in array order, and an edit only moves
+  // indices AFTER it. Sorting descending (within each segment, since indices are
+  // per-segment) keeps every later request pointing at the character it was
+  // computed from — no re-fetch, no arithmetic.
+  if (rewrites.length > 0) {
+    rewrites.sort((a, b) =>
+      a.segmentId === b.segmentId
+        ? b.startIndex - a.startIndex
+        : a.segmentId < b.segmentId
+          ? -1
+          : 1,
+    );
+
+    const requests = [];
+    for (const e of rewrites) {
+      requests.push(
+        { deleteContentRange: { range: docRange(e.segmentId, e.startIndex, e.endIndex) } },
+        { insertText: { location: docLocation(e.segmentId, e.startIndex), text: e.text } },
+        {
+          updateTextStyle: {
+            range: docRange(e.segmentId, e.startIndex, e.startIndex + e.text.length),
+            textStyle: e.style,
+            fields: e.fields,
+          },
+        },
+      );
+    }
+
+    await docsCall(`docs.batchUpdate(rewrite) ${fileEntry.name}`, () =>
+      docs.documents.batchUpdate({
+        documentId: fileEntry.id,
+        requestBody: { requests },
+      }),
+    );
+  }
+
+  return { successReplacements, failures, modified, alreadyCorrect };
+}
+
 /* --------------------------------------------------------- Google Sheets */
+
+/** The literal text a cell displays, which is what chip runs index into. */
+function uevText(cell) {
+  return cell.userEnteredValue?.stringValue ?? cell.formattedValue ?? '';
+}
 
 /**
  * Rewrites links across EVERY tab of a spreadsheet.
@@ -250,11 +668,18 @@ function rewriteUrlsInText(text, resolve) {
  *   2. plain URL typed in a cell     -> userEnteredValue.stringValue
  *   3. rich-text partial links       -> textFormatRuns[].format.link.uri
  *   4. whole-cell text link          -> userEnteredFormat.textFormat.link.uri
+ *   5. SMART CHIPS                   -> chipRuns[].chip.richLinkProperties.uri
+ *
+ * (5) is the one that hides: a chip's URL lives in `chipRuns`, a field that is
+ * not returned unless the mask asks for it, so a scan that omits it reports a
+ * clean sheet while every chip still points at the source file. Chips are
+ * converted to ordinary rich-text hyperlinks labelled with the file name —
+ * the same treatment Docs chips get.
  *
  * The read is scoped with a field mask so we don't pull entire grids of
  * unrelated formatting back over the wire.
  */
-async function processSheet(sheetsApi, fileEntry, resolve) {
+export async function processSheet(sheetsApi, fileEntry, resolve, nameById = new Map()) {
   const changes = [];
   const unresolved = [];
 
@@ -264,7 +689,7 @@ async function processSheet(sheetsApi, fileEntry, resolve) {
       includeGridData: true,
       fields:
         'sheets(properties(sheetId,title),data(startRow,startColumn,rowData(values(' +
-        'userEnteredValue,textFormatRuns,userEnteredFormat.textFormat.link))))',
+        'userEnteredValue,chipRuns,textFormatRuns,userEnteredFormat.textFormat.link))))',
     }),
   );
 
@@ -288,6 +713,116 @@ async function processSheet(sheetsApi, fileEntry, resolve) {
           const newValue = {};
           const fieldsTouched = [];
           let cellChanged = false;
+
+          // --- 5: smart chips -> rich-text hyperlinks labelled by file name ---
+          // Handled first and, when it fires, exclusively: it rewrites the
+          // cell's text and runs wholesale, so letting the text-based cases
+          // below also touch this cell would fight over the same fields.
+          const chipRuns = cell.chipRuns;
+          if (Array.isArray(chipRuns) && chipRuns.length) {
+            const text = typeof uevText(cell) === 'string' ? uevText(cell) : '';
+
+            // chipRuns are positional: run i covers [start_i, start_{i+1}).
+            const segments = chipRuns.map((run, i) => ({
+              start: run.startIndex ?? 0,
+              end: i + 1 < chipRuns.length ? (chipRuns[i + 1].startIndex ?? 0) : text.length,
+              chip: run.chip,
+            }));
+
+            let convertible = false; // at least one chip actually needs rewriting
+            let blocked = false;     // something in this cell must not be disturbed
+
+            for (const seg of segments) {
+              if (!seg.chip) continue; // plain text between chips
+              const uri = seg.chip.richLinkProperties?.uri;
+              if (!uri) {
+                // A person chip (or any other non-link chip). chipRuns can only
+                // be cleared for the whole cell, so converting here would
+                // destroy it — leave the cell alone entirely.
+                blocked = true;
+                break;
+              }
+              if (!isDocsOrDriveUrl(uri)) continue; // e.g. a YouTube chip
+              const r = resolve(uri);
+              if (r?.unresolved) {
+                // Never half-convert: dropping chipRuns would strip this chip
+                // of its link without being able to repoint it.
+                unresolved.push({ where, kind: 'chip', url: uri, oldId: r.oldId, reason: r.reason });
+                blocked = true;
+                break;
+              }
+              if (r) {
+                seg.newUrl = r.newUrl;
+                seg.newId = r.newId;
+                convertible = true;
+              }
+            }
+
+            if (blocked || !convertible) return;
+
+            // Character formatting already on the cell is carried across, so
+            // converting a chip does not silently drop bold/size/colour on the
+            // text around it.
+            const existingRuns = Array.isArray(cell.textFormatRuns) ? cell.textFormatRuns : [];
+            const formatAt = (idx) => {
+              let fmt = {};
+              for (const r of existingRuns) {
+                if ((r.startIndex ?? 0) <= idx) fmt = r.format ?? {};
+                else break;
+              }
+              return fmt;
+            };
+
+            // Rebuild the cell text and the run boundaries together, because a
+            // chip's label may change length when it takes the target file's
+            // current name.
+            let newText = '';
+            const runs = [];
+            for (const seg of segments) {
+              const original = text.slice(seg.start, seg.end);
+              const url = seg.newUrl ?? seg.chip?.richLinkProperties?.uri ?? null;
+              // Prefer the target file's live name; fall back to the chip's own
+              // rendered text so the cell never ends up blank.
+              const label = seg.chip
+                ? (seg.newId && nameById.get(seg.newId)) || original || url || ''
+                : original;
+
+              // A chip run list often ends with a zero-width trailing segment
+              // (startIndex === text.length). Emitting a run for it is rejected:
+              // a TextFormatRun must start strictly inside the string.
+              if (!label) continue;
+
+              const run = { startIndex: newText.length, format: { ...formatAt(seg.start) } };
+              if (seg.chip && url) run.format.link = { uri: url };
+              else delete run.format.link;
+              if (run.startIndex === 0) delete run.startIndex; // first run implies 0
+              runs.push(run);
+
+              newText += label;
+              if (seg.chip && url) {
+                changes.push({
+                  where,
+                  kind: 'chip',
+                  from: seg.chip.richLinkProperties.uri,
+                  to: url,
+                  displayText: label,
+                });
+              }
+            }
+
+            if (!newText || !runs.length) return; // nothing renderable left
+
+            requests.push({
+              updateCells: {
+                start: { sheetId, rowIndex, columnIndex: colIndex },
+                rows: [{ values: [{ userEnteredValue: { stringValue: newText }, textFormatRuns: runs }] }],
+                // chipRuns is listed but absent from the payload, which is how
+                // updateCells clears it — the chips become plain linked text.
+                fields: 'userEnteredValue,textFormatRuns,chipRuns',
+              },
+            });
+            return;
+          }
 
           // --- 1 & 2: formula or plain string content ---
           // These go inside userEnteredValue, not at the top of CellData —
@@ -474,8 +1009,11 @@ async function processOoxml(drive, fileEntry, resolve) {
 /* ------------------------------------------------------------------- main */
 
 async function main() {
-  if (!TARGET_FOLDER_ID) {
-    console.error('TARGET_FOLDER_ID is not set. Put it in .env and retry.');
+  if (!TARGET_FOLDER_ID || !SOURCE_FOLDER_ID) {
+    console.error(
+      'Both SOURCE_FOLDER_ID and TARGET_FOLDER_ID must be set in .env.\n' +
+        'The id-map is rebuilt from scratch on every run, which needs both trees.',
+    );
     process.exit(1);
   }
 
@@ -492,72 +1030,46 @@ async function main() {
   const docsApi = google.docs({ version: 'v1', auth });
   const sheetsApi = google.sheets({ version: 'v4', auth });
 
-  let idMap = await loadOrBuildIdMap(drive);
-  console.log(`id-map:  ${Object.keys(idMap).length} entries`);
-
-  console.log('\nScanning target tree…');
-  let { allItems } = await listTarget(drive, TARGET_FOLDER_ID);
-
   /**
-   * PREFLIGHT: does every id the map points AT still exist in the target tree?
+   * The id-map is DERIVED DATA, rebuilt from the two live trees on every run.
    *
-   * A map built against an earlier migration keeps resolving — its keys are the
-   * unchanged source ids — but its values name files that were replaced or
-   * deleted. The run then reports "12 links replaced" while pointing every one
-   * of them at a dead id, and nothing downstream can tell the difference. That
-   * failure is silent, permanent, and only visible by opening the files, so it
-   * is checked here before a single write goes out.
+   * The old file is deleted before the build rather than overwritten, so a build
+   * that fails partway leaves no map at all instead of a stale one that would
+   * still resolve — and would resolve to files that no longer exist. Losing it
+   * costs nothing: the next run rebuilds it anyway.
    */
-  async function validateIdMap() {
-    const known = new Set(allItems.map((i) => i.id));
-    known.add(TARGET_FOLDER_ID); // the root is never listed as its own child
-    return Object.entries(idMap).filter(([, newId]) => !known.has(newId));
-  }
+  console.log('\nRebuilding id-map from SOURCE/TARGET…');
+  await fs.rm(ID_MAP_PATH, { force: true });
 
-  let stale = await validateIdMap();
+  const built = await buildIdMap(drive, {
+    sourceFolderId: SOURCE_FOLDER_ID,
+    targetFolderId: TARGET_FOLDER_ID,
+    outputPath: ID_MAP_PATH,
+    write: true,
+  });
+  const idMap = built.idMap;
+
+  // The build already walked the target tree; reuse that listing instead of
+  // paying for a second identical walk.
+  const allItems = built.targetItems;
+
+  // Belt and braces: the map was just derived from this listing, so a value
+  // outside it means the walk was incomplete (a folder that failed to list).
+  // Writing links from a partial map is the failure this whole design avoids.
+  const knownIds = new Set(allItems.map((i) => i.id));
+  knownIds.add(TARGET_FOLDER_ID); // the root is never listed as its own child
+  const stale = Object.entries(idMap).filter(([, newId]) => !knownIds.has(newId));
   if (stale.length > 0) {
-    console.log(
-      `\n[stale id-map] ${stale.length}/${Object.keys(idMap).length} entries point at ids ` +
-        'that are NOT in the target tree:',
+    console.error(
+      `\n${stale.length}/${Object.keys(idMap).length} freshly built id-map entries point at ids ` +
+        'that are not in the target tree.\nThe target scan was incomplete — aborting before any write.',
     );
     for (const [oldId, newId] of stale.slice(0, 10)) {
-      console.log(`    ${oldId}  ->  ${newId}   (missing)`);
+      console.error(`    ${oldId}  ->  ${newId}   (missing)`);
     }
-    if (stale.length > 10) console.log(`    …and ${stale.length - 10} more`);
-
-    if (!REBUILD_MAP) {
-      console.error(
-        '\nRefusing to run: rewriting links with this map would point them at files\n' +
-          'that no longer exist. Rebuild the map against the current target tree:\n' +
-          '\n    node buildIdMap.js\n' +
-          '\nor re-run this script with --rebuild-map to do it automatically.',
-      );
-      process.exit(1);
-    }
-
-    console.log('\n--rebuild-map: rebuilding id-map.json from SOURCE/TARGET…');
-    if (!SOURCE_FOLDER_ID) {
-      console.error('SOURCE_FOLDER_ID is not set — cannot rebuild. Set it in .env.');
-      process.exit(1);
-    }
-    const rebuilt = await buildIdMap(drive, {
-      sourceFolderId: SOURCE_FOLDER_ID,
-      targetFolderId: TARGET_FOLDER_ID,
-      write: true,
-    });
-    idMap = rebuilt.idMap;
-    ({ allItems } = await listTarget(drive, TARGET_FOLDER_ID));
-    stale = await validateIdMap();
-    if (stale.length > 0) {
-      console.error(
-        `\nStill ${stale.length} unresolvable entries after rebuild — aborting.`,
-      );
-      process.exit(1);
-    }
-    console.log(`id-map:  rebuilt, ${Object.keys(idMap).length} entries, all valid`);
-  } else {
-    console.log(`id-map:  all ${Object.keys(idMap).length} target ids verified present`);
+    process.exit(1);
   }
+  console.log(`id-map:  ${Object.keys(idMap).length} entries, all verified present`);
 
   const targets = allItems.filter(
     (f) => KIND_BY_MIME[f.mimeType] && kindEnabled(KIND_BY_MIME[f.mimeType]),
@@ -576,20 +1088,18 @@ async function main() {
   // Ids already living in the target tree count as "already correct", so
   // re-running the script does not re-report links it fixed last time.
   const targetIds = new Set(allItems.map((i) => i.id));
+  // id -> name across the target tree. Used to label a converted smart chip
+  // (Docs or Sheets) with the name of the file it actually points at.
+  const targetNameById = new Map(allItems.map((i) => [i.id, i.name]));
   const resolve = makeResolver(idMap, targetIds);
 
-  // Docs reuse the existing resolver context from updateDocLinks.js (which
-  // additionally does its own name-based fallback).
+  /** Shared context handed to processDoc for every target doc. */
   const docCtx = {
     dryRun: DRY_RUN,
     idMap,
-    targetNameIndex: new Map(),
     targetIdSet: targetIds,
+    targetNameById,
     sourceIdSet: null,
-    oldIdMetaCache: new Map(),
-    fallbackResolutions: new Map(),
-    fallbackMeta: new Map(),
-    ambiguousOldIds: new Set(),
   };
 
   const changesLog = [];
@@ -673,7 +1183,7 @@ async function main() {
           modified: r.modified,
         };
       } else if (kind === 'sheets') {
-        result = await processSheet(sheetsApi, file, resolve);
+        result = await processSheet(sheetsApi, file, resolve, targetNameById);
       } else {
         result = await processOoxml(drive, file, resolve);
       }

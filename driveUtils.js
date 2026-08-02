@@ -73,7 +73,7 @@ export const WRITE_RATE_MAX = Math.max(
 export const FILE_QUEUE_MAX = Math.floor(envNum('FILE_QUEUE_MAX', 20_000, { min: 100 }));
 
 /**
- * Google Docs workers in updateDocLinks.js. Capped low on purpose: each doc is
+ * Google Docs workers in updateAllLinks.js. Capped low on purpose: each doc is
  * a read plus one or more batchUpdate writes against the Docs API, whose quota
  * is far tighter than Drive's.
  */
@@ -699,8 +699,8 @@ export async function walkTrees(drive, roots, ctx) {
           operation: 'files.list',
           side: job.side,
           failedFileId: job.id,
-          // Callers that walk a single tree name the side themselves (updateDocLinks
-          // uses 'tree'); claiming that is a source or target folder would be a lie,
+          // Callers that walk a single tree name the side themselves (some use
+          // 'tree'); claiming that is a source or target folder would be a lie,
           // so it goes under the neutral key instead.
           sourceFolder: job.side === 'source' ? folder : undefined,
           targetFolder: job.side === 'target' ? folder : undefined,

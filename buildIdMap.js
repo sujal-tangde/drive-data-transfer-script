@@ -30,6 +30,7 @@ import {
   createStatusPrinter,
   createWalkContext,
   flushIssues,
+  FOLDER_MIME,
   formatDuration,
   governors,
   isMainModule,
@@ -259,8 +260,16 @@ export async function buildIdMap(drive, opts) {
     }
   }
 
+  // The target walk that produced the map is also everything a caller needs to
+  // then act on the target tree, so it is handed back rather than re-walked.
+  const targetItems = [
+    ...[...tgtFolders].map(([p, f]) => ({ ...f, mimeType: FOLDER_MIME, path: p })),
+    ...[...tgtFiles].map(([p, f]) => ({ ...f, path: p })),
+  ];
+
   return {
     idMap,
+    targetItems,
     matchedFiles,
     matchedFolders,
     unmatchedFiles,
