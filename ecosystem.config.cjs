@@ -7,6 +7,15 @@ module.exports = {
       cwd: __dirname,
       autorestart: false,
       max_restarts: 0,
+      args: '--continue-with-re-copy',
+    },
+    {
+      // Full pipeline: re-copy, then rewrite links (migrateAndUpdateLinks.js).
+      name: 'drive-sync',
+      script: 'migrateAndUpdateLinks.js',
+      cwd: __dirname,
+      autorestart: false,
+      max_restarts: 0,
     },
     {
       name: 'drive-verify',
