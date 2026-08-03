@@ -4,12 +4,15 @@
  *   1. node index.js --continue-with-re-copy
  *   2. node updateAllLinks.js   (only if step 1 exits 0)
  *
- * Extra CLI flags are forwarded to updateAllLinks only
- * (e.g. --dry-run, --only=docs, --skip=docx,xlsx).
+ * A continue flag goes to index.js and everything else to updateAllLinks
+ * (e.g. --dry-run, --only=docs, --skip=docx,xlsx). Forwarding a continue flag
+ * to updateAllLinks instead would drop it silently and migrate in the wrong
+ * mode. The default is unchanged: --continue-with-re-copy.
  *
  * USAGE
  *   node migrateAndUpdateLinks.js
  *   node migrateAndUpdateLinks.js --dry-run
+ *   node migrateAndUpdateLinks.js --continue-with-re-copy-handled-duplicates
  *   npm run sync
  *   npm run sync -- --dry-run
  *
@@ -48,13 +51,24 @@ function runStep(label, script, args) {
   });
 }
 
+const CONTINUE_FLAGS = new Set([
+  '--continue-if-incomplete',
+  '--continue-with-re-copy',
+  '--continue-with-re-copy-handled-duplicates',
+]);
+
 async function main() {
-  const extraArgs = process.argv.slice(2);
+  const argv = process.argv.slice(2);
+  const migrateArgs = argv.filter((arg) => CONTINUE_FLAGS.has(arg));
+  const extraArgs = argv.filter((arg) => !CONTINUE_FLAGS.has(arg));
+  // index.js rejects two continue flags itself, so passing them straight
+  // through keeps one place deciding what a valid combination is.
+  if (migrateArgs.length === 0) migrateArgs.push('--continue-with-re-copy');
 
   const migrateCode = await runStep(
-    'STEP 1/2 — migrate (re-copy)',
+    `STEP 1/2 — migrate (${migrateArgs.join(' ')})`,
     'index.js',
-    ['--continue-with-re-copy'],
+    migrateArgs,
   );
 
   if (migrateCode !== 0) {

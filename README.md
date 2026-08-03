@@ -93,10 +93,44 @@ The first run prints a URL — open it, sign in as the **target** account, appro
 | ---------------------------------------- | -------------------------------------------------------------------------------------- |
 | *(default)* / `--continue-if-incomplete` | Skip files that already exist in the target by name; copy only missing                 |
 | `--continue-with-re-copy`                | Delete same-named **target** files, then re-copy from source (source is never deleted) |
+| `--continue-with-re-copy-handled-duplicates` | Same file handling as `--continue-with-re-copy`, but same-named sibling **folders** are mirrored one-for-one instead of merged |
 | `--verbose` / `-v`                       | Add a per-file log line on top of the status block                                     |
 
 
-Do not pass both `--continue-if-incomplete` and `--continue-with-re-copy`.
+Pass at most **one** of `--continue-if-incomplete`, `--continue-with-re-copy` and `--continue-with-re-copy-handled-duplicates`. Passing two or more fails immediately with exit code 1.
+
+#### `--continue-with-re-copy-handled-duplicates`
+
+Drive lets one folder hold several children with the same name. The other two modes resolve a target folder by `(parent, name)`, so same-named source siblings all end up merged into one target folder:
+
+```text
+source                       target (--continue-with-re-copy)
+Test/                        Test/
+  nested 1   (id A)            nested 1     <- A and B merged here
+  nested 1   (id B)            nested 2
+  nested 2
+```
+
+This mode keeps them apart instead — one target folder per source folder:
+
+```text
+source                       target (--continue-with-re-copy-handled-duplicates)
+Test/                        Test/
+  nested 1   (id A)            nested 1     <- A
+  nested 1   (id B)            nested 1     <- B
+  nested 2                     nested 2
+```
+
+Files behave exactly as in `--continue-with-re-copy`: a same-named target file is deleted and re-copied from source. **Nothing in the source is ever modified, and no target folder is ever deleted** — including duplicates.
+
+**Resume pairing.** Because names collide, "the folder named X" no longer identifies a folder, so re-runs pair by position under each parent: source folders named `X` (ordered by source id) line up with existing target folders named `X` (ordered oldest-first by `createdTime`), index for index.
+
+- Source has more than the target → the unpaired ones are created.
+- Target has more than the source → the oldest `sourceCount` are paired, the extras are left untouched and reported as `ambiguous-folder` in `logs/issues.log`.
+
+Both orderings are computed by the migrator rather than taken from Drive, which returns children in no promised order — so a re-run refills the *same* target folder from the *same* source folder rather than swapping twins. Re-running against a target that already matches creates no new folders.
+
+**Limitation.** The path-based tools — `verify.js`, `getMissing.js`, `buildIdMap.js` and the link rewriters — key on full slash-paths, and duplicate sibling folders give two distinct folders the same path. Against a tree migrated in this mode their per-path results are ambiguous: `verify.js` may report false matches or extras, and `buildIdMap.js` will map only one of the twins per path. `index.js` itself is unaffected (it works by folder id).
 
 `--skip-scan` was removed — there is no longer a separate pre-scan pass to skip. Passing it prints a note and is ignored.
 
@@ -226,10 +260,10 @@ Old-ID metadata lookups are shared across concurrent docs: the first document to
 
 ## Behavior notes
 
-- **Source is read-only** for migration: list + copy only. Deletes (in `--continue-with-re-copy`) apply only to duplicate files in the **target**.
+- **Source is read-only** for migration: list + copy only. Deletes (in `--continue-with-re-copy` and `--continue-with-re-copy-handled-duplicates`) apply only to duplicate files in the **target**. Folders are never deleted in any mode.
 - **Trashed** items are skipped (`trashed = false`).
 - **Shortcuts** are skipped and logged; copy their targets manually if needed.
-- Existing **folders** in the target with the same name are reused (not duplicated).
+- Existing **folders** in the target with the same name are reused (not duplicated) — unless you run `--continue-with-re-copy-handled-duplicates`, which mirrors same-named sibling folders one-for-one instead.
 - Status is printed as a two-line block once per second (`[progress]` + `[scan]`). Totals and ETA firm up as the walk discovers the tree; percentages are prefixed `~` until discovery finishes.
 - **Concurrent**, with duplicate-safety by construction: a folder queue is drained by `WALK_CONCURRENCY` walkers, and each source folder is enqueued exactly once, so exactly one worker ever writes into a given target folder. Walkers feed a file queue drained by `COPY_CONCURRENCY` copiers, overlapping traversal with copying.
 - **Rate limits** are handled by an adaptive governor with separate read/write token buckets. A 403/429 cuts the rate for every worker at once (coalesced, so one episode is one cut) and the rate creeps back up once things are calm. You should not need to tune this by hand. The governor is process-wide, so running `index.js` and `getMissing.js` at the same time does **not** coordinate them — they will each push their own rate up and compete for the same quota.

@@ -3,8 +3,9 @@
  * using drive.files.list + drive.files.create (folders) + drive.files.copy (files).
  * Native Google Workspace files stay native (no export/import).
  *
- * The SOURCE folder is read-only: list + copy only. Deletes apply to TARGET
- * duplicates only in --continue-with-re-copy mode, never to source items.
+ * The SOURCE folder is read-only: list + copy only. Deletes apply to duplicate
+ * TARGET *files* only, in the two --continue-with-re-copy* modes; never to
+ * source items and never to a folder on either side.
  *
  * Concurrency model
  *   - A folder queue is drained by WALK_CONCURRENCY walkers. Each source folder
@@ -20,6 +21,10 @@
  * Resume modes:
  *   --continue-if-incomplete   skip files already present in target (default)
  *   --continue-with-re-copy    delete+re-copy same-named target files, then continue
+ *   --continue-with-re-copy-handled-duplicates
+ *                              same file handling as --continue-with-re-copy, but
+ *                              same-named sibling folders are mirrored one-for-one
+ *                              instead of being merged into the first match
  */
 
 import * as fs from 'node:fs/promises';
@@ -31,6 +36,8 @@ import {
   apiStats,
   appendErrorDetail,
   appendIssue,
+  compareByCreatedTime,
+  compareIds,
   COPY_CONCURRENCY,
   createStatusPrinter,
   driveCall,
@@ -61,18 +68,42 @@ import {
   WRITE_RATE_MAX,
 } from './driveUtils.js';
 
-const WANT_CONTINUE_IF_INCOMPLETE = process.argv.includes('--continue-if-incomplete');
-const WANT_CONTINUE_WITH_RE_COPY = process.argv.includes('--continue-with-re-copy');
+// Exact argv matches, so --continue-with-re-copy-handled-duplicates does not
+// also read as --continue-with-re-copy.
+const CONTINUE_FLAGS = [
+  '--continue-if-incomplete',
+  '--continue-with-re-copy',
+  '--continue-with-re-copy-handled-duplicates',
+].filter((flag) => process.argv.includes(flag));
 
-if (WANT_CONTINUE_IF_INCOMPLETE && WANT_CONTINUE_WITH_RE_COPY) {
+if (CONTINUE_FLAGS.length > 1) {
   console.error(
-    'Use only one of --continue-if-incomplete or --continue-with-re-copy (not both).',
+    `Use only one continue mode at a time (got ${CONTINUE_FLAGS.join(', ')}).\n` +
+      'Pick one of --continue-if-incomplete, --continue-with-re-copy or --continue-with-re-copy-handled-duplicates.',
   );
   process.exit(1);
 }
 
+const WANT_HANDLED_DUPLICATES = CONTINUE_FLAGS[0] === '--continue-with-re-copy-handled-duplicates';
+const WANT_CONTINUE_WITH_RE_COPY = CONTINUE_FLAGS[0] === '--continue-with-re-copy';
+
 /** 'skip' = resume without re-copying; 'recopy' = replace existing target files. */
-const COPY_MODE = WANT_CONTINUE_WITH_RE_COPY ? 'recopy' : 'skip';
+const COPY_MODE = WANT_CONTINUE_WITH_RE_COPY || WANT_HANDLED_DUPLICATES ? 'recopy' : 'skip';
+
+/**
+ * 'reuse-by-name'       one target folder per name — same-named source siblings
+ *                       all end up in the same target folder (long-standing
+ *                       behaviour of the other two modes)
+ * 'preserve-duplicates' one target folder per source folder, paired by ordinal
+ *                       so a re-run adopts the folders it made last time
+ */
+const FOLDER_MODE = WANT_HANDLED_DUPLICATES ? 'preserve-duplicates' : 'reuse-by-name';
+
+const MODE_LABEL = WANT_HANDLED_DUPLICATES
+  ? '--continue-with-re-copy-handled-duplicates'
+  : WANT_CONTINUE_WITH_RE_COPY
+    ? '--continue-with-re-copy'
+    : '--continue-if-incomplete (default)';
 
 const SCOPES = ['https://www.googleapis.com/auth/drive',
   'https://www.googleapis.com/auth/documents'
@@ -306,6 +337,193 @@ function createStatusLogger(stats, walkState, runtime, queues) {
 }
 
 /**
+ * reuse-by-name: resolve-or-create one target folder for `name`.
+ *
+ * Serialized per (target parent + name) and reads the target from Drive rather
+ * than from the parent listing this walker already has. That snapshot only
+ * reflects folders present when the parent was listed, so a subtree left by an
+ * earlier partial run — or a duplicate created earlier in this run — is
+ * invisible to it, and the old code would create a second copy. The
+ * authoritative lookup inside the lock closes that window: any existing folder
+ * is adopted, and only one create can win per name.
+ */
+async function resolveFolderByName(drive, job, item, ctx) {
+  const { stats, copyMode, folderMode } = ctx;
+  const { id, name, mimeType } = item;
+  let targetId;
+  let targetKnownEmpty = false;
+
+  await withKeyedLock(`folder:${job.targetId}:${name}`, async () => {
+    const existingFolders = await findChildFoldersByName(drive, job.targetId, name).catch((err) => {
+      throw tagFailure(err, 'files.list', {
+        side: 'target',
+        failedFileId: job.targetId,
+        sourceFile: { id, name, mimeType },
+      });
+    });
+
+    if (existingFolders.length > 0) {
+      targetId = existingFolders[0].id;
+      stats.foldersReused += 1;
+      if (existingFolders.length > 1) {
+        // Pre-existing duplicates in the target (e.g. left by a run made
+        // before this fix). Reported, not created — this branch never adds
+        // a folder, so it cannot make the situation worse.
+        stats.foldersAmbiguous += 1;
+        const message = `${existingFolders.length} target folders named "${name}"; continuing in the first`;
+        appendIssue('ambiguous-folder', message);
+        appendErrorDetail('ambiguous-folder', `folder ${name}`, message, {
+          operation: 'files.list',
+          copyMode,
+          folderMode,
+          sourceFile: { id, name, mimeType },
+          targetFile: { id: targetId, name },
+          sourceFolder: { id: job.sourceId, path: job.sourcePath },
+          targetFolder: { id: job.targetId, path: job.targetPath },
+          targetFileIds: existingFolders.map((f) => f.id),
+        });
+      }
+      if (VERBOSE) console.log(`Using existing folder: ${name}`);
+    } else {
+      targetId = await createTargetFolder(drive, job, item);
+      stats.foldersCreated += 1;
+      targetKnownEmpty = true;
+      if (VERBOSE) console.log(`Created folder: ${name}`);
+    }
+  });
+
+  return { targetId, targetKnownEmpty };
+}
+
+async function createTargetFolder(drive, job, item) {
+  const { id, name, mimeType } = item;
+  const created = await driveCall('write', `files.create folder ${name}`, () =>
+    drive.files.create({
+      requestBody: {
+        name,
+        mimeType: FOLDER_MIME,
+        parents: [job.targetId],
+      },
+      fields: 'id',
+      supportsAllDrives: true,
+    }),
+  ).catch((err) => {
+    // The id sent to files.create is the parent the folder goes into.
+    throw tagFailure(err, 'files.create', {
+      failedFileId: job.targetId,
+      sourceFile: { id, name, mimeType },
+    });
+  });
+
+  const targetId = created.data.id;
+  if (!targetId) throw new Error(`Folder create returned no id for ${name}`);
+  return targetId;
+}
+
+/**
+ * preserve-duplicates: dense ordinals for the same-named child folders of one
+ * source parent, so each gets its own target folder instead of all of them
+ * collapsing into the first.
+ *
+ * Sorted by id, not by listing order: Drive promises no order, and a resume
+ * that saw its sources in a different order would pair them against the wrong
+ * target subtrees. Multi-parent folders already walked elsewhere are dropped
+ * here rather than skipped later, so the ordinals stay dense — a gap would ask
+ * for a target folder at an index that can never exist, and every re-run would
+ * create one more.
+ *
+ * Runs synchronously, so the visited check and claim cannot interleave with
+ * another walker's.
+ */
+function planFolderOrdinals(children, visited, stats) {
+  const groups = new Map();
+  for (const item of children) {
+    if (item.mimeType !== FOLDER_MIME || !item.id || !item.name) continue;
+    const bucket = groups.get(item.name);
+    if (bucket) bucket.push(item);
+    else groups.set(item.name, [item]);
+  }
+
+  const slots = new Map();
+  for (const bucket of groups.values()) {
+    bucket.sort((a, b) => compareIds(a.id, b.id));
+    const walkable = [];
+    for (const item of bucket) {
+      // Drive allows an item to have several parents, so the same folder can
+      // surface under two listings. Walk it once or it gets copied twice.
+      if (visited.has(item.id)) {
+        stats.foldersDeduped += 1;
+        continue;
+      }
+      visited.add(item.id);
+      walkable.push(item);
+    }
+    walkable.forEach((item, ordinal) => slots.set(item.id, { ordinal, group: walkable }));
+  }
+
+  return slots;
+}
+
+/**
+ * preserve-duplicates: gives every same-named source sibling its own target
+ * folder, creating whatever is missing.
+ *
+ * The whole group is resolved in one pass under one lock so creation order
+ * matches ordinal order — that is what lets the next run re-pair by ordinal.
+ * Existing targets are adopted oldest-first, extras beyond the source count are
+ * left untouched, and nothing is ever deleted.
+ */
+async function pairFolderGroup(drive, job, name, group, ctx) {
+  const { stats, copyMode, folderMode } = ctx;
+  const paired = [];
+
+  await withKeyedLock(`folder:${job.targetId}:${name}`, async () => {
+    const existing = await findChildFoldersByName(drive, job.targetId, name).catch((err) => {
+      throw tagFailure(err, 'files.list', {
+        side: 'target',
+        failedFileId: job.targetId,
+        sourceFile: { id: group[0].id, name, mimeType: FOLDER_MIME },
+      });
+    });
+    existing.sort(compareByCreatedTime);
+
+    for (let ordinal = 0; ordinal < group.length; ordinal += 1) {
+      if (ordinal < existing.length) {
+        paired.push({ targetId: existing[ordinal].id, targetKnownEmpty: false });
+        stats.foldersReused += 1;
+        if (VERBOSE) {
+          console.log(`Using existing folder: ${name} [${ordinal + 1}/${group.length}]`);
+        }
+        continue;
+      }
+      const targetId = await createTargetFolder(drive, job, group[ordinal]);
+      paired.push({ targetId, targetKnownEmpty: true });
+      stats.foldersCreated += 1;
+      if (VERBOSE) console.log(`Created folder: ${name} [${ordinal + 1}/${group.length}]`);
+    }
+
+    if (existing.length > group.length) {
+      stats.foldersAmbiguous += 1;
+      const message =
+        `${existing.length} target folders named "${name}" but ${group.length} in source; ` +
+        `paired the ${group.length} oldest, left ${existing.length - group.length} untouched`;
+      appendIssue('ambiguous-folder', message);
+      appendErrorDetail('ambiguous-folder', `folder ${name}`, message, {
+        operation: 'files.list',
+        copyMode,
+        folderMode,
+        sourceFolder: { id: job.sourceId, path: job.sourcePath },
+        targetFolder: { id: job.targetId, path: job.targetPath },
+        sourceFileIds: group.map((f) => f.id),
+        targetFileIds: existing.map((f) => f.id),
+      });
+    }
+  });
+
+  return paired;
+}
+
+/**
  * Mirrors one source folder into its target counterpart: creates/reuses child
  * folders, enqueues child folders for other walkers, and enqueues file copies.
  *
@@ -313,7 +531,7 @@ function createStatusLogger(stats, walkState, runtime, queues) {
  * folder reaches it exactly once — that is what rules out duplicate folders.
  */
 async function walkFolder(drive, job, ctx) {
-  const { stats, walkState, runtime, queues, sourceIds, visited, copyMode } = ctx;
+  const { stats, walkState, runtime, queues, sourceIds, visited, copyMode, folderMode } = ctx;
   runtime.currentFolder = job.name;
   sourceIds.add(job.sourceId);
 
@@ -339,87 +557,42 @@ async function walkFolder(drive, job, ctx) {
     else targetByName.set(child.name, [child]);
   }
 
+  // preserve-duplicates claims every walkable child folder up front and resolves
+  // each name group in one shot, so ordinals and creation order agree.
+  const folderPlan =
+    folderMode === 'preserve-duplicates' ? planFolderOrdinals(children, visited, stats) : null;
+  const pairedGroups = new Map();
+
   for (const item of children) {
     const { id, name, mimeType } = item;
     if (!id || !name) continue;
     sourceIds.add(id);
 
     if (mimeType === FOLDER_MIME) {
-      // Drive allows an item to have several parents, so the same folder can
-      // surface under two listings. Walk it once or it gets copied twice.
-      if (visited.has(id)) {
-        stats.foldersDeduped += 1;
-        continue;
-      }
-      visited.add(id);
-
       let targetId;
       let targetKnownEmpty = false;
 
-      // Resolve-or-create is serialized per (target parent + name) and reads the
-      // target from Drive rather than from `targetByName`. The cached snapshot
-      // only reflects folders present when this walker listed the parent, so a
-      // subtree left by an earlier partial run — or a duplicate created earlier
-      // in this run — is invisible to it, and the old code would create a second
-      // copy. The authoritative lookup inside the lock closes that window: any
-      // existing folder is adopted, and only one create can win per name.
-      await withKeyedLock(`folder:${job.targetId}:${name}`, async () => {
-        const existingFolders = await findChildFoldersByName(drive, job.targetId, name).catch(
-          (err) => {
-            throw tagFailure(err, 'files.list', {
-              side: 'target',
-              failedFileId: job.targetId,
-              sourceFile: { id, name, mimeType },
-            });
-          },
-        );
-
-        if (existingFolders.length > 0) {
-          targetId = existingFolders[0].id;
-          stats.foldersReused += 1;
-          if (existingFolders.length > 1) {
-            // Pre-existing duplicates in the target (e.g. left by a run made
-            // before this fix). Reported, not created — this branch never adds
-            // a folder, so it cannot make the situation worse.
-            stats.foldersAmbiguous += 1;
-            const message = `${existingFolders.length} target folders named "${name}"; continuing in the first`;
-            appendIssue('ambiguous-folder', message);
-            appendErrorDetail('ambiguous-folder', `folder ${name}`, message, {
-              operation: 'files.list',
-              copyMode,
-              sourceFile: { id, name, mimeType },
-              targetFile: { id: targetId, name },
-              sourceFolder: { id: job.sourceId, path: job.sourcePath },
-              targetFolder: { id: job.targetId, path: job.targetPath },
-              targetFileIds: existingFolders.map((f) => f.id),
-            });
-          }
-          if (VERBOSE) console.log(`Using existing folder: ${name}`);
-        } else {
-          const created = await driveCall('write', `files.create folder ${name}`, () =>
-            drive.files.create({
-              requestBody: {
-                name,
-                mimeType: FOLDER_MIME,
-                parents: [job.targetId],
-              },
-              fields: 'id',
-              supportsAllDrives: true,
-            }),
-          ).catch((err) => {
-            // The id sent to files.create is the parent the folder goes into.
-            throw tagFailure(err, 'files.create', {
-              failedFileId: job.targetId,
-              sourceFile: { id, name, mimeType },
-            });
-          });
-          targetId = created.data.id;
-          if (!targetId) throw new Error(`Folder create returned no id for ${name}`);
-          stats.foldersCreated += 1;
-          targetKnownEmpty = true;
-          if (VERBOSE) console.log(`Created folder: ${name}`);
+      if (folderPlan) {
+        const slot = folderPlan.get(id);
+        // Absent means the plan already counted it as a multi-parent folder
+        // walked under another parent.
+        if (!slot) continue;
+        let paired = pairedGroups.get(name);
+        if (!paired) {
+          paired = await pairFolderGroup(drive, job, name, slot.group, ctx);
+          pairedGroups.set(name, paired);
         }
-      });
+        ({ targetId, targetKnownEmpty } = paired[slot.ordinal]);
+      } else {
+        // Drive allows an item to have several parents, so the same folder can
+        // surface under two listings. Walk it once or it gets copied twice.
+        if (visited.has(id)) {
+          stats.foldersDeduped += 1;
+          continue;
+        }
+        visited.add(id);
+        ({ targetId, targetKnownEmpty } = await resolveFolderByName(drive, job, item, ctx));
+      }
 
       queues.folders.push({
         sourceId: id,
@@ -544,6 +717,7 @@ async function runPools(drive, ctx) {
         recordFailure(ctx, `folder ${job.name}`, err, {
           operation: 'files.list',
           copyMode: ctx.copyMode,
+          folderMode: ctx.folderMode,
           sourceFolder: { id: job.sourceId, path: job.sourcePath },
           targetFolder: { id: job.targetId, path: job.targetPath },
         });
@@ -568,6 +742,7 @@ async function runPools(drive, ctx) {
         recordFailure(ctx, `file ${job.name}`, err, {
           operation: 'files.copy',
           copyMode: ctx.copyMode,
+          folderMode: ctx.folderMode,
           enqueuedAt: job.enqueuedAt,
           sourceFile: { id: job.sourceId, name: job.name, mimeType: job.mimeType },
           // Same-named file(s) already in the target: empty in skip mode, since
@@ -663,18 +838,26 @@ async function main() {
     sourceIds,
     visited,
     copyMode: COPY_MODE,
+    folderMode: FOLDER_MODE,
     failures: [],
     aborted: false,
   };
 
   console.log('Source folder will not be modified (list + copy only).');
-  if (COPY_MODE === 'skip') {
+  if (FOLDER_MODE === 'preserve-duplicates') {
     console.log(
-      'Mode: --continue-if-incomplete (default) — skip files already in target; copy only missing.',
+      `Mode: ${MODE_LABEL} — replace same-named target files, then copy missing;`,
+    );
+    console.log(
+      '      same-named sibling folders are mirrored one-for-one instead of merged.',
+    );
+  } else if (COPY_MODE === 'recopy') {
+    console.log(
+      `Mode: ${MODE_LABEL} — replace same-named target files, then copy missing.`,
     );
   } else {
     console.log(
-      'Mode: --continue-with-re-copy — replace same-named target files, then copy missing.',
+      `Mode: ${MODE_LABEL} — skip files already in target; copy only missing.`,
     );
   }
   console.log('Starting recursive copy…');
@@ -708,8 +891,12 @@ async function main() {
   }
 
   console.log(ctx.aborted ? '\nInterrupted.' : '\nDone.');
+  console.log(`  Mode:            ${MODE_LABEL} (files: ${COPY_MODE}, folders: ${FOLDER_MODE})`);
   console.log(`  Folders created: ${stats.foldersCreated}`);
-  console.log(`  Folders reused:  ${stats.foldersReused}`);
+  console.log(
+    `  Folders reused:  ${stats.foldersReused}` +
+      (FOLDER_MODE === 'preserve-duplicates' ? ' (paired by ordinal within each name)' : ''),
+  );
   console.log(`  Files copied:    ${stats.filesCopied}`);
   if (stats.filesSkipped) {
     console.log(`  Files skipped:   ${stats.filesSkipped} (already present in target)`);
@@ -721,7 +908,11 @@ async function main() {
     console.log(`  Folders deduped: ${stats.foldersDeduped} (multi-parent source folders walked once)`);
   }
   if (stats.foldersAmbiguous) {
-    console.log(`  Folders ambiguous: ${stats.foldersAmbiguous} (duplicate names in target; used first — see ${ISSUE_LOG})`);
+    console.log(
+      FOLDER_MODE === 'preserve-duplicates'
+        ? `  Folders ambiguous: ${stats.foldersAmbiguous} (more same-named folders in target than source; extras left untouched — see ${ISSUE_LOG})`
+        : `  Folders ambiguous: ${stats.foldersAmbiguous} (duplicate names in target; used first — see ${ISSUE_LOG})`,
+    );
   }
   if (stats.skippedShortcuts) {
     console.log(`  Shortcuts skipped: ${stats.skippedShortcuts} (copy targets manually if needed)`);

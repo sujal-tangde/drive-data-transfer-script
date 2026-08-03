@@ -10,6 +10,16 @@ module.exports = {
       args: '--continue-with-re-copy',
     },
     {
+      // Same as drive-copy, but same-named sibling folders are mirrored
+      // one-for-one instead of merged into the first match.
+      name: 'drive-copy-handled-duplicates',
+      script: 'index.js',
+      cwd: __dirname,
+      autorestart: false,
+      max_restarts: 0,
+      args: '--continue-with-re-copy-handled-duplicates',
+    },
+    {
       // Full pipeline: re-copy, then rewrite links (migrateAndUpdateLinks.js).
       name: 'drive-sync',
       script: 'migrateAndUpdateLinks.js',

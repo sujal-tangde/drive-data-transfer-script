@@ -547,6 +547,9 @@ export async function listChildren(drive, folderId) {
  * whose folders never appear in this run's in-memory snapshot — is adopted
  * instead of re-created. Returns every non-trashed folder child of `parentId`
  * with exactly `name`, so the caller can also detect pre-existing duplicates.
+ *
+ * `createdTime` comes back too so callers that keep duplicates apart can order
+ * them the way they were made (see compareByCreatedTime).
  */
 export async function findChildFoldersByName(drive, parentId, name) {
   // Escape single quotes for the query literal ("Foo's" -> "Foo\'s").
@@ -563,7 +566,7 @@ export async function findChildFoldersByName(drive, parentId, name) {
         q,
         pageSize: 1000,
         pageToken: pageToken || undefined,
-        fields: 'nextPageToken, files(id, name, mimeType)',
+        fields: 'nextPageToken, files(id, name, mimeType, createdTime)',
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
       }),
@@ -575,6 +578,30 @@ export async function findChildFoldersByName(drive, parentId, name) {
   } while (pageToken);
 
   return all;
+}
+
+/** Byte order on ids: deterministic across runs, unlike locale collation. */
+export function compareIds(a, b) {
+  const x = String(a ?? '');
+  const y = String(b ?? '');
+  if (x === y) return 0;
+  return x < y ? -1 : 1;
+}
+
+/**
+ * Oldest-first order for same-named folders, id as tiebreak.
+ *
+ * Drive returns children in no promised order, so anything that pairs two lists
+ * of duplicates by position needs its own ordering or the pairing shifts between
+ * runs. Creation order is the useful one: it is the order the duplicates were
+ * made in, so a resume lines a source folder back up with the target folder it
+ * filled last time.
+ */
+export function compareByCreatedTime(a, b) {
+  const at = a?.createdTime ?? '';
+  const bt = b?.createdTime ?? '';
+  if (at !== bt) return at < bt ? -1 : 1;
+  return compareIds(a?.id, b?.id);
 }
 
 /**
