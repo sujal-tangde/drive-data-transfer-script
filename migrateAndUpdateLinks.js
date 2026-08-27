@@ -54,6 +54,7 @@ function runStep(label, script, args) {
 const CONTINUE_FLAGS = new Set([
   '--continue-if-incomplete',
   '--continue-with-re-copy',
+  '--continue-with-re-copy-last-updated',
   '--continue-with-re-copy-handled-duplicates',
 ]);
 

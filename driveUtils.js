@@ -527,7 +527,7 @@ export async function listChildren(drive, folderId) {
         q,
         pageSize: 1000,
         pageToken: pageToken || undefined,
-        fields: 'nextPageToken, files(id, name, mimeType, shortcutDetails)',
+        fields: 'nextPageToken, files(id, name, mimeType, modifiedTime, shortcutDetails)',
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
       }),

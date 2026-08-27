@@ -93,11 +93,14 @@ The first run prints a URL — open it, sign in as the **target** account, appro
 | ---------------------------------------- | -------------------------------------------------------------------------------------- |
 | *(default)* / `--continue-if-incomplete` | Skip files that already exist in the target by name; copy only missing                 |
 | `--continue-with-re-copy`                | Delete same-named **target** files, then re-copy from source (source is never deleted) |
+| `--continue-with-re-copy-last-updated`   | Compare `modifiedTime`; replace the target only when the source file is newer           |
 | `--continue-with-re-copy-handled-duplicates` | Same file handling as `--continue-with-re-copy`, but same-named sibling **folders** are mirrored one-for-one instead of merged |
 | `--verbose` / `-v`                       | Add a per-file log line on top of the status block                                     |
 
 
-Pass at most **one** of `--continue-if-incomplete`, `--continue-with-re-copy` and `--continue-with-re-copy-handled-duplicates`. Passing two or more fails immediately with exit code 1.
+Pass at most **one** of `--continue-if-incomplete`, `--continue-with-re-copy`, `--continue-with-re-copy-last-updated` and `--continue-with-re-copy-handled-duplicates`. Passing two or more fails immediately with exit code 1.
+
+With `--continue-with-re-copy-last-updated`, files are matched by name inside the corresponding folder. If the source is strictly newer than every same-named target file, those target files are deleted and the source is copied. If the target is newer or has the same timestamp, it is kept. Missing or invalid timestamps also keep the target rather than risking a destructive replacement.
 
 #### `--continue-with-re-copy-handled-duplicates`
 
@@ -260,7 +263,7 @@ Old-ID metadata lookups are shared across concurrent docs: the first document to
 
 ## Behavior notes
 
-- **Source is read-only** for migration: list + copy only. Deletes (in `--continue-with-re-copy` and `--continue-with-re-copy-handled-duplicates`) apply only to duplicate files in the **target**. Folders are never deleted in any mode.
+- **Source is read-only** for migration: list + copy only. Deletes in the `--continue-with-re-copy*` modes apply only to duplicate files in the **target**. Folders are never deleted in any mode.
 - **Trashed** items are skipped (`trashed = false`).
 - **Shortcuts** are skipped and logged; copy their targets manually if needed.
 - Existing **folders** in the target with the same name are reused (not duplicated) — unless you run `--continue-with-re-copy-handled-duplicates`, which mirrors same-named sibling folders one-for-one instead.
@@ -295,7 +298,7 @@ Every script writes two failure logs into `logs/`, both appended to across runs.
   "errorCode": 403,                   //   failure did not come back from the API
   "errorReason": "insufficientFilePermissions",
   "operation": "files.delete",        // the call that actually failed
-  "copyMode": "recopy",               // skip | recopy, where it applies
+  "copyMode": "recopy",               // skip | recopy | recopy-last-updated
   "enqueuedAt": "...", "failedAt": "...", "queueWaitMs": 28,
   "info": {
     "sourceFile":   { "id": "...", "name": "Invoice.pdf", "mimeType": "application/pdf" },

@@ -4,7 +4,7 @@
  * Native Google Workspace files stay native (no export/import).
  *
  * The SOURCE folder is read-only: list + copy only. Deletes apply to duplicate
- * TARGET *files* only, in the two --continue-with-re-copy* modes; never to
+ * TARGET *files* only, in the --continue-with-re-copy* modes; never to
  * source items and never to a folder on either side.
  *
  * Concurrency model
@@ -21,6 +21,8 @@
  * Resume modes:
  *   --continue-if-incomplete   skip files already present in target (default)
  *   --continue-with-re-copy    delete+re-copy same-named target files, then continue
+ *   --continue-with-re-copy-last-updated
+ *                              replace only when the source file is newer
  *   --continue-with-re-copy-handled-duplicates
  *                              same file handling as --continue-with-re-copy, but
  *                              same-named sibling folders are mirrored one-for-one
@@ -73,22 +75,29 @@ import {
 const CONTINUE_FLAGS = [
   '--continue-if-incomplete',
   '--continue-with-re-copy',
+  '--continue-with-re-copy-last-updated',
   '--continue-with-re-copy-handled-duplicates',
 ].filter((flag) => process.argv.includes(flag));
 
 if (CONTINUE_FLAGS.length > 1) {
   console.error(
     `Use only one continue mode at a time (got ${CONTINUE_FLAGS.join(', ')}).\n` +
-      'Pick one of --continue-if-incomplete, --continue-with-re-copy or --continue-with-re-copy-handled-duplicates.',
+      'Pick one of --continue-if-incomplete, --continue-with-re-copy, ' +
+      '--continue-with-re-copy-last-updated or --continue-with-re-copy-handled-duplicates.',
   );
   process.exit(1);
 }
 
 const WANT_HANDLED_DUPLICATES = CONTINUE_FLAGS[0] === '--continue-with-re-copy-handled-duplicates';
 const WANT_CONTINUE_WITH_RE_COPY = CONTINUE_FLAGS[0] === '--continue-with-re-copy';
+const WANT_LAST_UPDATED = CONTINUE_FLAGS[0] === '--continue-with-re-copy-last-updated';
 
-/** 'skip' = resume without re-copying; 'recopy' = replace existing target files. */
-const COPY_MODE = WANT_CONTINUE_WITH_RE_COPY || WANT_HANDLED_DUPLICATES ? 'recopy' : 'skip';
+/** Controls whether same-named target files are kept, replaced, or compared by modified time. */
+const COPY_MODE = WANT_LAST_UPDATED
+  ? 'recopy-last-updated'
+  : WANT_CONTINUE_WITH_RE_COPY || WANT_HANDLED_DUPLICATES
+    ? 'recopy'
+    : 'skip';
 
 /**
  * 'reuse-by-name'       one target folder per name — same-named source siblings
@@ -101,6 +110,8 @@ const FOLDER_MODE = WANT_HANDLED_DUPLICATES ? 'preserve-duplicates' : 'reuse-by-
 
 const MODE_LABEL = WANT_HANDLED_DUPLICATES
   ? '--continue-with-re-copy-handled-duplicates'
+  : WANT_LAST_UPDATED
+    ? '--continue-with-re-copy-last-updated'
   : WANT_CONTINUE_WITH_RE_COPY
     ? '--continue-with-re-copy'
     : '--continue-if-incomplete (default)';
@@ -283,6 +294,27 @@ async function deleteTargetFileIfExists(drive, fileId, label, sourceIds) {
  */
 function childPath(parentPath, name) {
   return parentPath === '/' ? `/${name}` : `${parentPath}/${name}`;
+}
+
+/**
+ * Returns true unless every timestamp needed for the comparison is valid and
+ * the source is strictly newer than every same-named target file. Keeping the
+ * target on missing/invalid metadata avoids a destructive guess.
+ */
+function shouldKeepTargetByModifiedTime(sourceModifiedTime, targetFiles) {
+  if (targetFiles.length === 0) return false;
+
+  const sourceMs = Date.parse(sourceModifiedTime);
+  if (!Number.isFinite(sourceMs)) return true;
+
+  let newestTargetMs = -Infinity;
+  for (const target of targetFiles) {
+    const targetMs = Date.parse(target.modifiedTime);
+    if (!Number.isFinite(targetMs)) return true;
+    newestTargetMs = Math.max(newestTargetMs, targetMs);
+  }
+
+  return newestTargetMs >= sourceMs;
 }
 
 function progressDoneCount(stats) {
@@ -564,7 +596,7 @@ async function walkFolder(drive, job, ctx) {
   const pairedGroups = new Map();
 
   for (const item of children) {
-    const { id, name, mimeType } = item;
+    const { id, name, mimeType, modifiedTime } = item;
     if (!id || !name) continue;
     sourceIds.add(id);
 
@@ -628,6 +660,18 @@ async function walkFolder(drive, job, ctx) {
       continue;
     }
 
+    // Last-updated mode replaces the target only when the source is strictly
+    // newer than every same-named target file. Equal timestamps keep target.
+    if (
+      copyMode === 'recopy-last-updated' &&
+      shouldKeepTargetByModifiedTime(modifiedTime, existingSameName)
+    ) {
+      stats.filesSkipped += 1;
+      runtime.currentFile = name;
+      if (VERBOSE) console.log(`Keeping newer or equally recent target file: ${name}`);
+      continue;
+    }
+
     queues.files.push({
       sourceId: id,
       name,
@@ -636,7 +680,7 @@ async function walkFolder(drive, job, ctx) {
       sourcePath: job.sourcePath,
       targetParentId: job.targetId,
       targetPath: job.targetPath,
-      existing: copyMode === 'recopy' ? existingSameName : [],
+      existing: copyMode === 'skip' ? [] : existingSameName,
       enqueuedAt: Date.now(),
     });
   }
@@ -649,8 +693,9 @@ async function copyFile(drive, job, ctx) {
   const { stats, runtime, sourceIds, copyMode } = ctx;
   runtime.currentFile = job.name;
 
-  // Re-copy mode: remove same-named target files, then copy fresh from source.
-  if (copyMode === 'recopy') {
+  // Re-copy modes: remove same-named target files, then copy fresh from source.
+  // Last-updated jobs only reach this queue after the source won the comparison.
+  if (copyMode === 'recopy' || copyMode === 'recopy-last-updated') {
     for (const existing of job.existing) {
       if (!existing.id) continue;
       if (VERBOSE) console.log(`Replacing file: ${job.name}`);
@@ -855,6 +900,10 @@ async function main() {
     console.log(
       `Mode: ${MODE_LABEL} — replace same-named target files, then copy missing.`,
     );
+  } else if (COPY_MODE === 'recopy-last-updated') {
+    console.log(
+      `Mode: ${MODE_LABEL} — compare modified times and keep whichever file is newer.`,
+    );
   } else {
     console.log(
       `Mode: ${MODE_LABEL} — skip files already in target; copy only missing.`,
@@ -899,7 +948,13 @@ async function main() {
   );
   console.log(`  Files copied:    ${stats.filesCopied}`);
   if (stats.filesSkipped) {
-    console.log(`  Files skipped:   ${stats.filesSkipped} (already present in target)`);
+    console.log(
+      `  Files skipped:   ${stats.filesSkipped} (` +
+        (COPY_MODE === 'recopy-last-updated'
+          ? 'target was newer, equally recent, or could not be safely compared'
+          : 'already present in target') +
+        ')',
+    );
   }
   if (stats.filesReplaced) {
     console.log(`  Files replaced:  ${stats.filesReplaced} (removed same-named target file(s) before copy)`);
