@@ -278,9 +278,12 @@ async function deleteTargetFileIfExists(drive, fileId, label, sourceIds) {
       `Refusing to delete "${label}" (${fileId}): this id belongs to the source folder.`,
     );
   }
-  await driveCall('write', `files.delete ${label}`, () =>
-    drive.files.delete({
+  // Trashed, not files.delete: a permanent delete made a wrong replacement
+  // unrecoverable. From the trash it can be restored for 30 days.
+  await driveCall('write', `files.trash ${label}`, () =>
+    drive.files.update({
       fileId,
+      requestBody: { trashed: true },
       supportsAllDrives: true,
     }),
   );
@@ -297,24 +300,69 @@ function childPath(parentPath, name) {
 }
 
 /**
- * Returns true unless every timestamp needed for the comparison is valid and
- * the source is strictly newer than every same-named target file. Keeping the
- * target on missing/invalid metadata avoids a destructive guess.
+ * A copy's modifiedTime lands within moments of its createdTime. Anything later
+ * than this past createdTime means someone (or updateAllLinks.js) changed the
+ * target after it was copied.
  */
-function shouldKeepTargetByModifiedTime(sourceModifiedTime, targetFiles) {
-  if (targetFiles.length === 0) return false;
+const TARGET_EDIT_GRACE_MS = 60_000;
 
-  const sourceMs = Date.parse(sourceModifiedTime);
-  if (!Number.isFinite(sourceMs)) return true;
+/**
+ * recopy-last-updated: decides whether the same-named target file(s) may be
+ * replaced by the source.
+ *
+ * Comparing source.modifiedTime with target.modifiedTime is not enough. After
+ * the copy, source and target are two separate files that can both be edited.
+ * If the target was edited at T1 and the source was touched at T2 > T1 (even a
+ * one-cell fix, a rename, or a sync client re-saving it), "newer wins" deletes
+ * the target's edits. So the target's createdTime (when it was copied) is used
+ * as the common baseline instead:
+ *
+ *   - target changed since it was copied  -> keep it (never overwrite edits)
+ *   - source unchanged since the copy     -> keep it (nothing new to bring)
+ *   - only the source changed             -> replace
+ *
+ * Missing/invalid timestamps and same-named source siblings keep the target:
+ * either would mean guessing which file a target belongs to.
+ *
+ * @returns {{ replace: boolean, reason: string, conflict?: boolean }}
+ */
+function decideLastUpdated(source, targetFiles, sourceSameNameCount) {
+  if (targetFiles.length === 0) return { replace: true, reason: 'missing in target' };
 
-  let newestTargetMs = -Infinity;
-  for (const target of targetFiles) {
-    const targetMs = Date.parse(target.modifiedTime);
-    if (!Number.isFinite(targetMs)) return true;
-    newestTargetMs = Math.max(newestTargetMs, targetMs);
+  if (sourceSameNameCount > 1) {
+    return {
+      replace: false,
+      conflict: true,
+      reason: `${sourceSameNameCount} source files share this name; cannot tell which target belongs to which`,
+    };
   }
 
-  return newestTargetMs >= sourceMs;
+  const sourceMs = Date.parse(source.modifiedTime);
+  if (!Number.isFinite(sourceMs)) return { replace: false, reason: 'source modifiedTime missing' };
+
+  let newestCopyMs = -Infinity;
+  for (const target of targetFiles) {
+    const createdMs = Date.parse(target.createdTime);
+    const modifiedMs = Date.parse(target.modifiedTime);
+    if (!Number.isFinite(createdMs) || !Number.isFinite(modifiedMs)) {
+      return { replace: false, reason: 'target timestamps missing' };
+    }
+    if (modifiedMs > createdMs + TARGET_EDIT_GRACE_MS) {
+      return {
+        replace: false,
+        conflict: sourceMs > createdMs,
+        reason:
+          `target edited after copy (created ${target.createdTime}, modified ${target.modifiedTime})` +
+          (sourceMs > createdMs ? `; source also changed (${source.modifiedTime})` : ''),
+      };
+    }
+    newestCopyMs = Math.max(newestCopyMs, createdMs);
+  }
+
+  if (sourceMs <= newestCopyMs) {
+    return { replace: false, reason: 'source unchanged since it was copied' };
+  }
+  return { replace: true, reason: 'source changed since copy; target untouched' };
 }
 
 function progressDoneCount(stats) {
@@ -589,6 +637,12 @@ async function walkFolder(drive, job, ctx) {
     else targetByName.set(child.name, [child]);
   }
 
+  const sourceFileNameCounts = new Map();
+  for (const child of children) {
+    if (!child.name || child.mimeType === FOLDER_MIME || child.mimeType === SHORTCUT_MIME) continue;
+    sourceFileNameCounts.set(child.name, (sourceFileNameCounts.get(child.name) ?? 0) + 1);
+  }
+
   // preserve-duplicates claims every walkable child folder up front and resolves
   // each name group in one shot, so ordinals and creation order agree.
   const folderPlan =
@@ -596,7 +650,7 @@ async function walkFolder(drive, job, ctx) {
   const pairedGroups = new Map();
 
   for (const item of children) {
-    const { id, name, mimeType, modifiedTime } = item;
+    const { id, name, mimeType } = item;
     if (!id || !name) continue;
     sourceIds.add(id);
 
@@ -660,16 +714,25 @@ async function walkFolder(drive, job, ctx) {
       continue;
     }
 
-    // Last-updated mode replaces the target only when the source is strictly
-    // newer than every same-named target file. Equal timestamps keep target.
-    if (
-      copyMode === 'recopy-last-updated' &&
-      shouldKeepTargetByModifiedTime(modifiedTime, existingSameName)
-    ) {
-      stats.filesSkipped += 1;
-      runtime.currentFile = name;
-      if (VERBOSE) console.log(`Keeping newer or equally recent target file: ${name}`);
-      continue;
+    // Last-updated mode replaces the target only when the source changed since
+    // the copy and the target did not — see decideLastUpdated.
+    if (copyMode === 'recopy-last-updated') {
+      const decision = decideLastUpdated(
+        item,
+        existingSameName,
+        sourceFileNameCounts.get(name) ?? 1,
+      );
+      if (!decision.replace) {
+        stats.filesSkipped += 1;
+        runtime.currentFile = name;
+        const filePath = childPath(job.targetPath, name);
+        if (decision.conflict) {
+          stats.filesConflicted += 1;
+          appendIssue('kept-target-conflict', `${filePath}\t${decision.reason}`);
+        }
+        if (VERBOSE) console.log(`Keeping target file: ${filePath} (${decision.reason})`);
+        continue;
+      }
     }
 
     queues.files.push({
@@ -855,6 +918,7 @@ async function main() {
     filesCopied: 0,
     filesSkipped: 0,
     filesReplaced: 0,
+    filesConflicted: 0,
     filesFailed: 0,
     skippedShortcuts: 0,
     errors: 0,
@@ -902,7 +966,7 @@ async function main() {
     );
   } else if (COPY_MODE === 'recopy-last-updated') {
     console.log(
-      `Mode: ${MODE_LABEL} — compare modified times and keep whichever file is newer.`,
+      `Mode: ${MODE_LABEL} — replace only targets left untouched since copy whose source changed.`,
     );
   } else {
     console.log(
@@ -951,9 +1015,14 @@ async function main() {
     console.log(
       `  Files skipped:   ${stats.filesSkipped} (` +
         (COPY_MODE === 'recopy-last-updated'
-          ? 'target was newer, equally recent, or could not be safely compared'
+          ? 'target edited since copy, source unchanged, or could not be safely compared'
           : 'already present in target') +
         ')',
+    );
+  }
+  if (stats.filesConflicted) {
+    console.log(
+      `  Files conflicted: ${stats.filesConflicted} (target kept; check by hand — see ${ISSUE_LOG}, "kept-target-conflict")`,
     );
   }
   if (stats.filesReplaced) {

@@ -93,14 +93,23 @@ The first run prints a URL — open it, sign in as the **target** account, appro
 | ---------------------------------------- | -------------------------------------------------------------------------------------- |
 | *(default)* / `--continue-if-incomplete` | Skip files that already exist in the target by name; copy only missing                 |
 | `--continue-with-re-copy`                | Delete same-named **target** files, then re-copy from source (source is never deleted) |
-| `--continue-with-re-copy-last-updated`   | Compare `modifiedTime`; replace the target only when the source file is newer           |
+| `--continue-with-re-copy-last-updated`   | Replace the target only when the source changed since the copy **and** the target was not edited |
 | `--continue-with-re-copy-handled-duplicates` | Same file handling as `--continue-with-re-copy`, but same-named sibling **folders** are mirrored one-for-one instead of merged |
 | `--verbose` / `-v`                       | Add a per-file log line on top of the status block                                     |
 
 
 Pass at most **one** of `--continue-if-incomplete`, `--continue-with-re-copy`, `--continue-with-re-copy-last-updated` and `--continue-with-re-copy-handled-duplicates`. Passing two or more fails immediately with exit code 1.
 
-With `--continue-with-re-copy-last-updated`, files are matched by name inside the corresponding folder. If the source is strictly newer than every same-named target file, those target files are deleted and the source is copied. If the target is newer or has the same timestamp, it is kept. Missing or invalid timestamps also keep the target rather than risking a destructive replacement.
+With `--continue-with-re-copy-last-updated`, files are matched by name inside the corresponding folder, and the target's `createdTime` (the moment it was copied) is the baseline:
+
+- **Target edited after it was copied** (`modifiedTime` more than 60 s past `createdTime`): kept, always. If the source also changed, it is logged as `kept-target-conflict` in the issue log for a manual merge.
+- **Source not modified since the copy**: kept.
+- **Only the source changed**: the target is moved to the trash and the source is copied again.
+- **Several source files with the same name** in one folder, or missing timestamps: kept and logged, rather than guessing which target belongs to which source.
+
+Comparing only `source.modifiedTime` with `target.modifiedTime` is not safe. Both files can be edited after the copy, and any later touch on the source (a small fix, a rename, a sync client re-saving it) would overwrite the target's edits.
+
+In every `--continue-with-re-copy*` mode, replaced target files go to the Drive **trash** (restorable for 30 days) and are not permanently deleted.
 
 #### `--continue-with-re-copy-handled-duplicates`
 
